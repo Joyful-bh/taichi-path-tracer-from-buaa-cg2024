@@ -1,0 +1,7 @@
+taichi>=1.7.4,<1.8
+numpy>=1.26,<3
+PyYAML>=6.0,<7
+trimesh>=4.0,<5
+Pillow>=10.0,<12
+imageio>=2.34,<3
+pytest>=8.0,<9

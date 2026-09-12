@@ -1,0 +1,147 @@
+render:
+  backend: cuda
+  width: 1200
+  height: 1200
+  samples_per_pixel: 10000
+  max_bounce: 20
+  output: output/tardis_in_box.png
+  samples_per_batch: 16       # 每次 GPU kernel 为活跃像素追加的样本数；越大启动开销越低，但预览更新越慢
+  save_aovs: false            # 是否把 Albedo/Normal/Depth/Variance/SampleCount 保存为额外 PNG；内部统计不受影响
+  adaptive_sampling:
+    enabled: true             # 是否跳过已经收敛的像素；关闭后所有像素统一渲染 samples_per_pixel
+    min_spp: 64               # 每个像素在首次判断收敛前必须达到的最低样本数
+    max_spp: 10000            # 难收敛像素允许使用的最高样本数；开启时也是整次渲染的 SPP 上限
+    check_interval: 32        # 每累计多少 spp 检查一次收敛；越小响应越快，但检查开销越高
+    relative_error: 0.015     # 相对标准误差阈值；越小画质越稳、耗时越长
+    absolute_error: 0.001     # 绝对标准误差阈值，防止接近黑色区域因相对误差过大而无法停止
+
+background: [0.01, 0.01, 0.01]
+
+camera:
+  position: [0.0, 0.0, 15.0]
+  look_at:  [0.0, 0.0, -5.0]
+  up:        [0.0, 1.0, 0.0]
+  fov:       60.0
+  aperture:  0.0
+
+# ===== 场景尺寸变量 =====
+# 支持数值和字符串表达式，字符串中可使用 variables 中的名称和标准 math 函数。
+# 例：center: [-1.8, "-half + cube_sz/2", 1.0]  → 第二分量自动计算
+variables:
+  room:     10.0          # 房间边长
+  half:     "room / 2"   # 半边长 = 5.0
+  cube_sz:  3.0           # 正方体边长
+  cuboid_h: 5.0           # 长方体高度
+  cuboid_s: 3.0           # 长方体截面边长
+
+# ===== 用户材质（覆盖同名预定义材质）=====
+# 预定义材质无需声明，可直接在 objects 中引用：
+#   漫反射: red, green, blue, white, gray
+#   金属:   gold, silver, bronze
+#   介质:   glass, diamond
+#   光源:   light_white（8.0 强度白光）, light_warm（暖色）
+materials:
+  - name: wall_red           # Cornell Box 左墙红色（覆盖预定义 red）
+    type: lambertian
+    albedo: [0.90, 0.05, 0.05]
+
+  - name: wall_green         # Cornell Box 右墙绿色（覆盖预定义 green）
+    type: lambertian
+    albedo: [0.12, 0.45, 0.15]
+
+  - name: wall_front         # 前墙：白色漫反射 + 背面剔除
+    type: lambertian          # backcull=1：摄像机光线从背面穿入，室内光线正面散射
+    albedo: [0.73, 0.73, 0.73]
+    backcull: 1
+
+objects:
+  # ===== 房间六面 =====
+  - type: rectangle
+    material: white                    # 预定义白色漫反射
+    center: [0.0, "-half", 0.0]       # 地板 y = -5
+    width:  "room"
+    height: "room"
+    rotation: [90.0, 0.0, 0.0]
+
+  - type: rectangle
+    material: white
+    center: [0.0, "half", 0.0]        # 天花板 y = +5
+    width:  "room"
+    height: "room"
+    rotation: [90.0, 0.0, 0.0]
+
+  - type: rectangle
+    material: white
+    center: [0.0, 0.0, "-half"]       # 后墙 z = -5
+    width:  "room"
+    height: "room"
+    rotation: [0.0, 0.0, 0.0]
+
+  - type: rectangle
+    material: wall_front               # 前墙 z = +5，法线朝 -Z（室内侧）
+    center: [0.0, 0.0, "half"]        # z = +5
+    width:  "room"
+    height: "room"
+    rotation: [0.0, 180.0, 0.0]       # 翻转法线到 -Z，使摄像机光线从背面穿入
+
+  - type: rectangle
+    material: wall_red                 # 左墙 x = -5
+    center: ["-half", 0.0, 0.0]
+    width:  "room"
+    height: "room"
+    rotation: [0.0, -90.0, 0.0]
+
+  - type: rectangle
+    material: wall_green               # 右墙 x = +5
+    center: ["half", 0.0, 0.0]
+    width:  "room"
+    height: "room"
+    rotation: [0.0, -90.0, 0.0]
+
+  - type: mesh
+    model: ../data/tardis.glb
+    transform:
+      scale:     3.0
+      translate: [-2, -5, 1]
+      rotate:    [0, -45, 0]
+    material_override:
+      # 灯罩内发光圆柱（Glass_Opacity_Mat）：PBR override 使 loader 不把它当介质
+      # 而是当作自发光面，模拟冷白光源
+      Glass_Opacity_Mat:
+        emissive: [0.90, 0.95, 1.0]
+        emissive_intensity: 0.1
+
+      # Decals_Mat（门贴纸/标牌）：GLB mrTex 中 metallic 非零，高金属度在路径追踪中
+      # 极度依赖镜面方向，视角稍变就从高光跳到全黑。设为纯漫反射，保留法线贴图效果。
+      Decals_Mat:
+        metallic: 0.0
+        roughness: 0.45
+
+      # Tardis_Metal_Mat（灯外壳）：GLB baseColorFactor=(10,13,22) 已被 loader 归一化
+      # 不加 emissive，让它保持深色金属外观
+
+  # ===== 面光源（天花板内侧 4×4） =====
+  - type: rectangle
+    material: light_white              # 预定义白色面光（8.0 强度）
+    center: [0.0, "half - 0.01", 0.0]
+    width:  4.0
+    height: 4.0
+    rotation: [90.0, 0.0, 0.0]
+
+  # ===== 场景物体 =====
+  # - type: cube
+  #   material: red                      # 预定义: lambertian [0.8, 0.2, 0.2]（对应原 demo material_id=0）
+  #   center: [-1.8, "-half + cube_sz/2", 1.0]
+  #   size: "cube_sz"
+  #   rotation: [0.0, -10.0, 0.0]
+
+  # - type: cuboid
+  #   material: white
+  #   center: [1.6, "-half + cuboid_h/2", -0.5]
+  #   dimensions: ["cuboid_s", "cuboid_h", "cuboid_s"]
+  #   rotation: [0.0, 20.0, 0.0]
+
+  # - type: sphere
+  #   material: gold                     # 预定义: metal [1.0, 0.8, 0.2] fuzz=0.1
+  #   center: [2.0, "-half + 1", 3.0]   # y = -5 + 1 = -4，球心距地面 1 个单位
+  #   radius: 1.0
