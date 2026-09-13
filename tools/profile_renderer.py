@@ -12,9 +12,9 @@ import taichi as ti
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.io.loader import SceneLoader
-from src.geometry.bvh4 import BVH4System
+from experiments.bvh4 import BVH4System
 from src.renderer.path_tracer import PathTracer
-from src.renderer.wavefront_path_tracer import WavefrontPathTracer
+from experiments.wavefront_path_tracer import WavefrontPathTracer
 
 
 @ti.kernel

@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "taichi-path-tracer"
+version = "0.1.0"
+description = "A configurable Monte Carlo path tracer and rendering research project built with Python and Taichi"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+  { name = "dongzewu" },
+]
+keywords = ["ray-tracing", "path-tracing", "rendering", "taichi", "gpu"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: GPU",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Multimedia :: Graphics :: 3D Rendering",
+]
+dependencies = [
+  "taichi>=1.7.4,<1.8",
+  "numpy>=1.26,<3",
+  "PyYAML>=6.0,<7",
+  "trimesh>=4.0,<5",
+  "Pillow>=10.0,<12",
+  "imageio>=2.34,<3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0,<9"]
+
+[project.scripts]
+taichi-path-tracer = "taichi_path_tracer.__main__:main"
+
+[tool.setuptools]
+py-modules = ["main"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["taichi_path_tracer*", "src*", "experiments*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

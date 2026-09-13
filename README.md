@@ -29,8 +29,17 @@ Windows PowerShell：
 
 ```powershell
 .venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
+python -m pip install -e .
 ```
+
+开发环境（额外安装 pytest）：
+
+```powershell
+python -m pip install -e ".[dev]"
+```
+
+`requirements.txt` 继续保留给偏好传统依赖安装的用户；`pyproject.toml` 是项目元数据、
+依赖和命令行入口的唯一发布配置。
 
 ## 使用方法
 
@@ -38,6 +47,13 @@ python -m pip install -r requirements.txt
 
 ```bash
 python main.py --scene scene_files/cornell_box.yaml --mode preview
+```
+
+安装后可使用统一命令，或通过 Python 模块运行；二者与 `python main.py` 等价：
+
+```bash
+taichi-path-tracer --scene scene_files/cornell_box.yaml --mode preview
+python -m taichi_path_tracer --scene scene_files/cornell_box.yaml --mode preview
 ```
 
 离线渲染：
@@ -129,6 +145,7 @@ python main.py --scene scene_files/tardis.yaml --mode render --spp 512 --backend
 
 ```text
 main.py                    命令行入口
+pyproject.toml             项目元数据、依赖与统一命令行入口
 scene_files/               YAML 场景定义
 data/                      模型与纹理资源
 src/geometry/              图元、BVH 和光源采样
@@ -137,9 +154,20 @@ src/renderer/              路径追踪积分器
 src/scene/                 场景与相机
 src/textures/              纹理管理与采样
 src/io/                    场景加载与图像输出
+experiments/               不进入默认路径的 BVH4、wavefront 等架构实验
+tools/                     性能分析、遍历统计和质量比较工具
 tests/test_cornell.py      端到端烟雾测试
 output/                    默认渲染输出目录
 ```
+
+## 稳定性边界
+
+稳定公共路径包括 `main.py`/`taichi-path-tracer` 命令、YAML 场景加载、BVH2、
+megakernel 路径追踪器、材质与纹理、AOV、固定/自适应采样、NEE + MIS、图像输出和
+OIDN 集成。`src/` 内的这些模块由默认入口直接使用，修改时应保持现有配置兼容。
+
+`experiments/` 中的 BVH4 和 wavefront 路径队列只供研究与性能比较，默认渲染不会加载；
+其接口和性能不作为稳定承诺。`tools/` 是诊断与基准入口，也不属于渲染器公共 API。
 
 ## 运行测试
 
@@ -155,3 +183,7 @@ python -m pytest -q
 - GLB/GLTF 的 PBR 材质支持比 FBX/PLY 更完整。
 - PBR 自发光网格不会被面光源采样器作为 NEE 光源采样。
 - 场景容量和 BVH 遍历栈使用预分配上限。
+
+## 许可证
+
+项目使用 [MIT License](LICENSE)。
