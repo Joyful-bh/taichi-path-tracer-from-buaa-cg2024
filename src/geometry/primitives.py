@@ -18,10 +18,10 @@ from src.math_utils import make_rotation_matrix
 class SphereSystem:
     def __init__(self, max_spheres: int = 1024):
         self._max = max_spheres
-        # SoA Taichi 字段
-        self.center = ti.Vector.field(3, ti.f32, shape=(max_spheres,))
-        self.radius = ti.field(ti.f32, shape=(max_spheres,))
-        self.mat_id = ti.field(ti.i32, shape=(max_spheres,))
+        # GPU 字段在 bake() 时按实际数量分配。
+        self.center = None
+        self.radius = None
+        self.mat_id = None
         # Python 端缓冲
         self._centers  = []
         self._radii    = []
@@ -45,14 +45,17 @@ class SphereSystem:
     def bake(self):
         """将 Python 缓冲一次性上传到 GPU。在 build_bvh 之前调用。"""
         n = self._count
-        if n == 0:
-            return
-        c_arr = np.zeros((self._max, 3), np.float32)
-        r_arr = np.zeros(self._max, np.float32)
-        m_arr = np.zeros(self._max, np.int32)
-        c_arr[:n] = np.stack(self._centers)
-        r_arr[:n] = np.array(self._radii, np.float32)
-        m_arr[:n] = np.array(self._mat_ids, np.int32)
+        capacity = max(n, 1)
+        self.center = ti.Vector.field(3, ti.f32, shape=(capacity,))
+        self.radius = ti.field(ti.f32, shape=(capacity,))
+        self.mat_id = ti.field(ti.i32, shape=(capacity,))
+        c_arr = np.zeros((capacity, 3), np.float32)
+        r_arr = np.zeros(capacity, np.float32)
+        m_arr = np.zeros(capacity, np.int32)
+        if n:
+            c_arr[:n] = np.stack(self._centers)
+            r_arr[:n] = np.array(self._radii, np.float32)
+            m_arr[:n] = np.array(self._mat_ids, np.int32)
         self.center.from_numpy(c_arr)
         self.radius.from_numpy(r_arr)
         self.mat_id.from_numpy(m_arr)
@@ -78,40 +81,77 @@ class SphereSystem:
     # ------------------------------------------------------------------
 
     @ti.func
+    def hit_raw(self, sphere_id: ti.i32, ray_origin, ray_dir,
+                t_min: ti.f32, t_max: ti.f32):
+        """只计算交点距离；表面属性在最终最近命中确定后再解析。"""
+        c = self.center[sphere_id]
+        r = self.radius[sphere_id]
+        oc = ray_origin - c
+        a = ray_dir.norm_sqr()
+        half_b = oc.dot(ray_dir)
+        disc = half_b * half_b - a * (oc.norm_sqr() - r * r)
+        hit_t = t_max
+        # 巨型“地面球”会让 float32 计算 oc^2-r^2 时发生灾难性消减：
+        # 例如 r=10000 时两个约 1e8 的数相减，表面附近的微小差值会丢失，
+        # 并导致二次射线产生规律性的伪自相交。仅对大尺度球提升二次方程精度，
+        # 普通球仍走更快的 float32 路径。
+        if ti.abs(r) >= 1024.0:
+            ox = ti.cast(ray_origin[0], ti.f64) - ti.cast(c[0], ti.f64)
+            oy = ti.cast(ray_origin[1], ti.f64) - ti.cast(c[1], ti.f64)
+            oz = ti.cast(ray_origin[2], ti.f64) - ti.cast(c[2], ti.f64)
+            dx = ti.cast(ray_dir[0], ti.f64)
+            dy = ti.cast(ray_dir[1], ti.f64)
+            dz = ti.cast(ray_dir[2], ti.f64)
+            rd = ti.cast(r, ti.f64)
+            ad = dx * dx + dy * dy + dz * dz
+            hbd = ox * dx + oy * dy + oz * dz
+            cd = ox * ox + oy * oy + oz * oz - rd * rd
+            discd = hbd * hbd - ad * cd
+            if discd >= 0.0:
+                sqrt_d = ti.sqrt(discd)
+                root = (-hbd - sqrt_d) / ad
+                if not (ti.cast(t_min, ti.f64) < root < ti.cast(t_max, ti.f64)):
+                    root = (-hbd + sqrt_d) / ad
+                if ti.cast(t_min, ti.f64) < root < ti.cast(t_max, ti.f64):
+                    hit_t = ti.cast(root, ti.f32)
+        elif disc >= 0.0:
+            sqrt_d = ti.sqrt(disc)
+            root = (-half_b - sqrt_d) / a
+            if not (t_min < root < t_max):
+                root = (-half_b + sqrt_d) / a
+            if t_min < root < t_max:
+                hit_t = root
+        return hit_t
+
+    @ti.func
+    def resolve_hit(self, sphere_id: ti.i32, ray_origin, ray_dir, hit_t: ti.f32):
+        """解析最终球体命中的完整着色属性。"""
+        c = self.center[sphere_id]
+        r = self.radius[sphere_id]
+        hit_pos = ray_origin + hit_t * ray_dir
+        outward = (hit_pos - c) / r
+        front = ray_dir.dot(outward) < 0.0
+        hit_normal = outward if front else -outward
+        hit_tan = ti.Vector([0.0, 0.0, 0.0, 1.0])
+        hit_uv = ti.Vector([0.0, 0.0])
+        return hit_pos, hit_normal, hit_tan, hit_uv, self.mat_id[sphere_id], front
+
+    @ti.func
     def hit(self, sphere_id: ti.i32, ray_origin, ray_dir, t_min: ti.f32, t_max: ti.f32):
         """
         返回 (hit_t, hit_pos, hit_normal, hit_tan, hit_uv, hit_mat, front_face)。
         hit_t == t_max 表示未命中。球体不支持 UV 切线，切线返回零向量。
         """
-        c = self.center[sphere_id]
-        r = self.radius[sphere_id]
-        oc = ray_origin - c
-
-        # 使用 half-b 形式减小数值误差
-        a      = ray_dir.norm_sqr()
-        half_b = oc.dot(ray_dir)
-        disc   = half_b * half_b - a * (oc.norm_sqr() - r * r)
-
-        hit_t      = t_max
-        hit_pos    = ti.Vector([0.0, 0.0, 0.0])
+        hit_t = self.hit_raw(sphere_id, ray_origin, ray_dir, t_min, t_max)
+        hit_pos = ti.Vector([0.0, 0.0, 0.0])
         hit_normal = ti.Vector([0.0, 0.0, 0.0])
-        hit_tan    = ti.Vector([0.0, 0.0, 0.0, 1.0])
-        hit_uv     = ti.Vector([0.0, 0.0])
-        hit_mat    = -1
-        front      = True
-
-        if disc >= 0.0:
-            sqrt_d = ti.sqrt(disc)
-            root   = (-half_b - sqrt_d) / a
-            if not (t_min < root < t_max):
-                root = (-half_b + sqrt_d) / a
-            if t_min < root < t_max:
-                hit_t   = root
-                hit_pos = ray_origin + root * ray_dir
-                outward = (hit_pos - c) / r
-                front   = ray_dir.dot(outward) < 0.0
-                hit_normal = outward if front else -outward
-                hit_mat = self.mat_id[sphere_id]
+        hit_tan = ti.Vector([0.0, 0.0, 0.0, 1.0])
+        hit_uv = ti.Vector([0.0, 0.0])
+        hit_mat = -1
+        front = True
+        if hit_t < t_max:
+            hit_pos, hit_normal, hit_tan, hit_uv, hit_mat, front = \
+                self.resolve_hit(sphere_id, ray_origin, ray_dir, hit_t)
 
         return hit_t, hit_pos, hit_normal, hit_tan, hit_uv, hit_mat, front
 
@@ -135,24 +175,13 @@ class TriangleSystem:
 
     def __init__(self, max_triangles: int = 200_000):
         self._max = max_triangles
-        # SoA Taichi 字段
-        self.v0          = ti.Vector.field(3, ti.f32, shape=(max_triangles,))
-        self.v1          = ti.Vector.field(3, ti.f32, shape=(max_triangles,))
-        self.v2          = ti.Vector.field(3, ti.f32, shape=(max_triangles,))
-        self.n0          = ti.Vector.field(3, ti.f32, shape=(max_triangles,))
-        self.n1          = ti.Vector.field(3, ti.f32, shape=(max_triangles,))
-        self.n2          = ti.Vector.field(3, ti.f32, shape=(max_triangles,))
-        self.uv0         = ti.Vector.field(2, ti.f32, shape=(max_triangles,))
-        self.uv1         = ti.Vector.field(2, ti.f32, shape=(max_triangles,))
-        self.uv2         = ti.Vector.field(2, ti.f32, shape=(max_triangles,))
-        self.face_normal = ti.Vector.field(3, ti.f32, shape=(max_triangles,))
-        self.e1          = ti.Vector.field(3, ti.f32, shape=(max_triangles,))
-        self.e2          = ti.Vector.field(3, ti.f32, shape=(max_triangles,))
-        # 逐顶点切线（替代原来的逐面切线），支持 GLB TANGENT 属性插值
-        self.t0          = ti.Vector.field(4, ti.f32, shape=(max_triangles,))
-        self.t1          = ti.Vector.field(4, ti.f32, shape=(max_triangles,))
-        self.t2          = ti.Vector.field(4, ti.f32, shape=(max_triangles,))
-        self.mat_id      = ti.field(ti.i32, shape=(max_triangles,))
+        # GPU 字段在 bake() 时按实际三角形数分配。
+        self.v0 = self.v1 = self.v2 = None
+        self.n0 = self.n1 = self.n2 = None
+        self.uv0 = self.uv1 = self.uv2 = None
+        self.face_normal = self.e1 = self.e2 = None
+        self.t0 = self.t1 = self.t2 = None
+        self.mat_id = None
 
         self._count = 0
         # Python 端缓冲（列表，bake 时才转 numpy）
@@ -233,12 +262,28 @@ class TriangleSystem:
     def bake(self):
         """将 Python 缓冲一次性上传至 GPU。"""
         n = self._count
-        if n == 0:
-            return
+        capacity = max(n, 1)
+        self.v0 = ti.Vector.field(3, ti.f32, shape=(capacity,))
+        self.v1 = ti.Vector.field(3, ti.f32, shape=(capacity,))
+        self.v2 = ti.Vector.field(3, ti.f32, shape=(capacity,))
+        self.n0 = ti.Vector.field(3, ti.f32, shape=(capacity,))
+        self.n1 = ti.Vector.field(3, ti.f32, shape=(capacity,))
+        self.n2 = ti.Vector.field(3, ti.f32, shape=(capacity,))
+        self.uv0 = ti.Vector.field(2, ti.f32, shape=(capacity,))
+        self.uv1 = ti.Vector.field(2, ti.f32, shape=(capacity,))
+        self.uv2 = ti.Vector.field(2, ti.f32, shape=(capacity,))
+        self.face_normal = ti.Vector.field(3, ti.f32, shape=(capacity,))
+        self.e1 = ti.Vector.field(3, ti.f32, shape=(capacity,))
+        self.e2 = ti.Vector.field(3, ti.f32, shape=(capacity,))
+        self.t0 = ti.Vector.field(4, ti.f32, shape=(capacity,))
+        self.t1 = ti.Vector.field(4, ti.f32, shape=(capacity,))
+        self.t2 = ti.Vector.field(4, ti.f32, shape=(capacity,))
+        self.mat_id = ti.field(ti.i32, shape=(capacity,))
 
         def _pad(lst, shape_rest):
-            arr = np.zeros((self._max, *shape_rest), np.float32)
-            arr[:n] = np.stack(lst)
+            arr = np.zeros((capacity, *shape_rest), np.float32)
+            if n:
+                arr[:n] = np.stack(lst)
             return arr
 
         v0_arr = _pad(self._v0, (3,));  v1_arr = _pad(self._v1, (3,));  v2_arr = _pad(self._v2, (3,))
@@ -257,13 +302,13 @@ class TriangleSystem:
         self.uv2.from_numpy(uv2_arr)
 
         # face normal
-        fns = np.zeros((self._max, 3), np.float32)
+        fns = np.zeros((capacity, 3), np.float32)
         fns[:n] = _compute_face_normals_batch(v0_arr[:n], v1_arr[:n], v2_arr[:n])
         self.face_normal.from_numpy(fns)
 
         # 预计算边向量
-        e1_arr = np.zeros((self._max, 3), np.float32);  e1_arr[:n] = v1_arr[:n] - v0_arr[:n]
-        e2_arr = np.zeros((self._max, 3), np.float32);  e2_arr[:n] = v2_arr[:n] - v0_arr[:n]
+        e1_arr = np.zeros((capacity, 3), np.float32);  e1_arr[:n] = v1_arr[:n] - v0_arr[:n]
+        e2_arr = np.zeros((capacity, 3), np.float32);  e2_arr[:n] = v2_arr[:n] - v0_arr[:n]
         self.e1.from_numpy(e1_arr)
         self.e2.from_numpy(e2_arr)
 
@@ -271,9 +316,9 @@ class TriangleSystem:
         # 否则退回到逐面 UV 导数切线（三个顶点共用同一切线）。
         face_tans = _compute_tangents_batch(v0_arr[:n], v1_arr[:n], v2_arr[:n],
                                             uv0_arr[:n], uv1_arr[:n], uv2_arr[:n])
-        t0_arr = np.zeros((self._max, 4), np.float32)
-        t1_arr = np.zeros((self._max, 4), np.float32)
-        t2_arr = np.zeros((self._max, 4), np.float32)
+        t0_arr = np.zeros((capacity, 4), np.float32)
+        t1_arr = np.zeros((capacity, 4), np.float32)
+        t2_arr = np.zeros((capacity, 4), np.float32)
         t0_arr[:n, :3] = face_tans   # 默认：逐面切线，右手 TBN
         t1_arr[:n, :3] = face_tans
         t2_arr[:n, :3] = face_tans
@@ -292,7 +337,7 @@ class TriangleSystem:
         self.t1.from_numpy(t1_arr)
         self.t2.from_numpy(t2_arr)
 
-        m_arr = np.zeros(self._max, np.int32);  m_arr[:n] = np.array(self._mat, np.int32)
+        m_arr = np.zeros(capacity, np.int32);  m_arr[:n] = np.array(self._mat, np.int32)
         self.mat_id.from_numpy(m_arr)
 
     def compute_bboxes(self):
@@ -362,25 +407,17 @@ class TriangleSystem:
     # ------------------------------------------------------------------
 
     @ti.func
-    def hit(self, tri_id: ti.i32, ray_origin, ray_dir, t_min: ti.f32, t_max: ti.f32):
-        """
-        返回 (hit_t, hit_pos, hit_normal, hit_tan, hit_uv, hit_mat, front_face)。
-        hit_t == t_max 表示未命中。
-        法线：使用重心坐标插值顶点法线（Phong 着色），正背面通过面法线判断。
-        切线：重心坐标插值逐顶点切线（GLB TANGENT 属性，或退回到逐面 UV 切线），用于法线贴图 TBN。
-        """
+    def hit_raw(self, tri_id: ti.i32, ray_origin, ray_dir,
+                t_min: ti.f32, t_max: ti.f32):
+        """Möller–Trumbore 求交，仅返回 t/u/v，不访问着色属性。"""
         e1 = self.e1[tri_id]
         e2 = self.e2[tri_id]
         h  = ray_dir.cross(e2)
         a  = e1.dot(h)
 
-        hit_t      = t_max
-        hit_pos    = ti.Vector([0.0, 0.0, 0.0])
-        hit_normal = ti.Vector([0.0, 0.0, 0.0])
-        hit_tan    = ti.Vector([0.0, 0.0, 0.0, 1.0])
-        hit_uv     = ti.Vector([0.0, 0.0])
-        hit_mat    = -1
-        front      = True
+        hit_t = t_max
+        hit_u = 0.0
+        hit_v = 0.0
 
         if ti.abs(a) > 1e-8:
             f = 1.0 / a
@@ -392,37 +429,49 @@ class TriangleSystem:
                 if v >= 0.0 and u + v <= 1.0:
                     t = f * e2.dot(q)
                     if t_min < t < t_max:
-                        hit_t   = t
-                        hit_pos = ray_origin + t * ray_dir
-                        hit_mat = self.mat_id[tri_id]
+                        hit_t = t
+                        hit_u = u
+                        hit_v = v
+        return hit_t, hit_u, hit_v
 
-                        # 重心坐标：w = 1-u-v，u，v
-                        w          = 1.0 - u - v
-                        interp_n   = (w * self.n0[tri_id]
-                                    + u * self.n1[tri_id]
-                                    + v * self.n2[tri_id]).normalized()
-                        face_n     = self.face_normal[tri_id]
-                        front      = ray_dir.dot(face_n) < 0.0
-                        # 法线朝向光线来源侧
-                        hit_normal = interp_n if front else -interp_n
+    @ti.func
+    def resolve_hit(self, tri_id: ti.i32, ray_origin, ray_dir,
+                    hit_t: ti.f32, u: ti.f32, v: ti.f32):
+        """只为 BVH 最终选出的最近三角形计算完整表面属性。"""
+        hit_pos = ray_origin + hit_t * ray_dir
+        w = 1.0 - u - v
+        interp_n = (w * self.n0[tri_id] + u * self.n1[tri_id]
+                    + v * self.n2[tri_id]).normalized()
+        face_n = self.face_normal[tri_id]
+        front = ray_dir.dot(face_n) < 0.0
+        hit_normal = interp_n if front else -interp_n
+        hit_uv = w * self.uv0[tri_id] + u * self.uv1[tri_id] + v * self.uv2[tri_id]
 
-                        hit_uv = (w * self.uv0[tri_id]
-                                + u * self.uv1[tri_id]
-                                + v * self.uv2[tri_id])
+        t_interp = w * self.t0[tri_id] + u * self.t1[tri_id] + v * self.t2[tri_id]
+        tangent_xyz = ti.Vector([t_interp[0], t_interp[1], t_interp[2]])
+        t_len = tangent_xyz.norm()
+        if t_len > 1e-6:
+            tangent_xyz /= t_len
+        else:
+            tangent_xyz = ti.Vector([1.0, 0.0, 0.0])
+        tangent_sign = 1.0 if t_interp[3] >= 0.0 else -1.0
+        hit_tan = ti.Vector([tangent_xyz[0], tangent_xyz[1], tangent_xyz[2], tangent_sign])
+        return hit_pos, hit_normal, hit_tan, hit_uv, self.mat_id[tri_id], front
 
-                        # 逐顶点切线插值（GLB TANGENT 属性或逐面回退值）
-                        t_interp = (w * self.t0[tri_id]
-                                  + u * self.t1[tri_id]
-                                  + v * self.t2[tri_id])
-                        tangent_xyz = ti.Vector([t_interp[0], t_interp[1], t_interp[2]])
-                        t_len = tangent_xyz.norm()
-                        if t_len > 1e-6:
-                            tangent_xyz = tangent_xyz / t_len
-                        else:
-                            tangent_xyz = ti.Vector([1.0, 0.0, 0.0])
-                        tangent_sign = 1.0 if t_interp[3] >= 0.0 else -1.0
-                        hit_tan = ti.Vector([tangent_xyz[0], tangent_xyz[1], tangent_xyz[2], tangent_sign])
-
+    @ti.func
+    def hit(self, tri_id: ti.i32, ray_origin, ray_dir,
+            t_min: ti.f32, t_max: ti.f32):
+        """兼容接口；BVH 热路径使用 hit_raw + resolve_hit。"""
+        hit_t, u, v = self.hit_raw(tri_id, ray_origin, ray_dir, t_min, t_max)
+        hit_pos = ti.Vector([0.0, 0.0, 0.0])
+        hit_normal = ti.Vector([0.0, 0.0, 0.0])
+        hit_tan = ti.Vector([0.0, 0.0, 0.0, 1.0])
+        hit_uv = ti.Vector([0.0, 0.0])
+        hit_mat = -1
+        front = True
+        if hit_t < t_max:
+            hit_pos, hit_normal, hit_tan, hit_uv, hit_mat, front = \
+                self.resolve_hit(tri_id, ray_origin, ray_dir, hit_t, u, v)
         return hit_t, hit_pos, hit_normal, hit_tan, hit_uv, hit_mat, front
 
     def load_obj(self, obj_path: str, mat_id: int = 0,

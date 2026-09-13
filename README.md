@@ -1,6 +1,6 @@
 # Taichi 路径追踪渲染器
 
-这是一个使用 Python 和 Taichi 实现的蒙特卡洛路径追踪器。项目支持 YAML 场景配置、BVH 加速、多种材质、GLB/GLTF 纹理材质导入、面光源直接采样，以及渐进式预览和离线 PNG 输出。
+这是一个使用 Python 和 Taichi 实现的蒙特卡洛路径追踪器。项目支持 YAML 场景配置、BVH 加速、多种材质、GLB/GLTF 纹理材质导入、三角形/球形光源直接采样与 MIS，以及渐进式预览和离线 PNG 输出。
 
 ## 主要功能
 
@@ -10,7 +10,7 @@
 - Lambertian、金属、介质、Clearcoat、自发光和 metallic-roughness PBR 材质
 - 基础色、法线、金属度/粗糙度和自发光贴图
 - OBJ、GLB/GLTF、FBX 和 PLY 网格加载
-- 面光源 NEE（Next Event Estimation）
+- 三角形和球形光源 NEE；光源采样与 BSDF 采样使用 MIS power heuristic 合并
 - ACES 色调映射和 Gamma 校正
 
 ## 环境要求
@@ -54,7 +54,7 @@ render:
   samples_per_batch: 16
   save_aovs: false
   adaptive_sampling:
-    enabled: true
+    enabled: false
     min_spp: 64
     max_spp: 2048
     check_interval: 32
@@ -63,10 +63,43 @@ render:
 ```
 
 `samples_per_batch` 默认为 16，用于减少 GPU kernel 启动次数。`save_aovs` 默认为 `false`；
-设为 `true` 时才会保存 `albedo`、`normal`、`depth`、`variance` 和 `sample_count` 侧车 PNG。
-这个开关不会关闭渲染器内部的 AOV/方差统计，因此不影响自适应采样，也不妨碍以后直接在内存中接入降噪器。
-自适应采样默认开启；像素至少采样 `min_spp`，然后根据
-亮度标准误差停止已收敛像素，最多采样 `max_spp`。
+固定采样且 `save_aovs: false` 时，渲染器使用专用快速 kernel，不计算或写入 AOV 与方差统计；
+设为 `true` 时才累积并保存 `albedo`、`normal`、`depth`、`variance` 和 `sample_count`。
+自适应采样目前默认关闭；关闭时所有像素统一渲染 `samples_per_pixel`。
+
+### OIDN 高质量降噪
+
+项目通过 Intel Open Image Denoise 的官方 `oidnDenoise` 程序处理线性 HDR beauty，
+并默认使用反照率和世界空间法线 AOV 保护材质、几何边界。OIDN 是独立的原生运行时，
+不属于 Python requirements；请安装官方 OIDN 2.x，并将 `bin` 加入 `PATH`，或设置
+`OIDN_DENOISE_EXECUTABLE`。如果系统临时目录不可写，可用 `OIDN_TEMP_DIR` 指向一个
+可写目录。也可以在场景中填写可执行文件绝对路径：
+
+```yaml
+render:
+  save_aovs: false            # 可不保存 AOV 图片；OIDN 仍会在内存中使用 AOV
+  denoising:
+    enabled: true
+    executable: auto
+    device: default
+    quality: high
+    use_albedo: true
+    use_normal: true
+    save_noisy: true
+    output: null
+```
+
+启用后，`output` 指定的文件保留未降噪结果，降噪结果默认命名为
+`<原文件名>_denoised.png`。设置 `save_noisy: false` 可只保存降噪图；`output` 可指定
+降噪图的单独路径。降噪在 ACES 色调映射之前完成，PFM 中转保持 float32 HDR 精度。
+若启用降噪，渲染器会自动计算所需 AOV，因此相较固定采样快速 kernel 会有少量开销。
+
+可用较高 SPP 参考图进行可重复的质量比较：
+
+```bash
+python tools/compare_denoising.py --scene scene_files/cornell_box.yaml \
+  --low-spp 32 --reference-spp 256 --oidn-executable /path/to/oidnDenoise
+```
 
 覆盖场景中的采样数、后端和输出路径：
 

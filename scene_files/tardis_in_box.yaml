@@ -6,9 +6,18 @@ render:
   max_bounce: 20
   output: output/tardis_in_box.png
   samples_per_batch: 16       # 每次 GPU kernel 为活跃像素追加的样本数；越大启动开销越低，但预览更新越慢
-  save_aovs: false            # 是否把 Albedo/Normal/Depth/Variance/SampleCount 保存为额外 PNG；内部统计不受影响
+  save_aovs: false            # 关闭时固定采样快速 kernel 不写 AOV；开启后保存额外 AOV PNG
+  denoising:
+    enabled: false            # OIDN 总开关；开启后自动在内存中生成引导 AOV，不要求 save_aovs=true
+    executable: auto          # auto 从 PATH/OIDN_DENOISE_EXECUTABLE 查找，也可填写 oidnDenoise.exe 绝对路径
+    device: default           # default 自动选择；也可用 cpu/cuda/sycl/hip/metal（须由安装包支持）
+    quality: high             # high 画质优先；balanced/fast 更快但不建议用于最终高保真输出
+    use_albedo: true          # 用反照率约束材质边界，通常是最重要的引导信息
+    use_normal: true          # 用世界空间着色法线约束几何边缘和表面细节
+    save_noisy: true          # 同时保留 output 原始图；降噪图默认在文件名后加 _denoised
+    output: null              # null 自动命名；也可指定降噪结果路径
   adaptive_sampling:
-    enabled: true             # 是否跳过已经收敛的像素；关闭后所有像素统一渲染 samples_per_pixel
+    enabled: false            # 当前默认关闭；所有像素统一渲染 samples_per_pixel，并使用固定采样快速 kernel
     min_spp: 64               # 每个像素在首次判断收敛前必须达到的最低样本数
     max_spp: 10000            # 难收敛像素允许使用的最高样本数；开启时也是整次渲染的 SPP 上限
     check_interval: 32        # 每累计多少 spp 检查一次收敛；越小响应越快，但检查开销越高

@@ -1,269 +1,291 @@
-"""
-BVH（层次包围体）系统。
+"""CPU binned-SAH BVH builder and Taichi GPU traversal."""
 
-构建阶段（Python CPU 端）:
-  - 对所有图元按最长轴中点划分，递归构建二叉树。
-  - 子节点先于递归调用分配，保证左子在 start_index，右子在 start_index+1。
-  - 展平成数组后通过 from_numpy 批量上传到 Taichi field。
-
-遍历阶段（Taichi GPU 端）:
-  - 栈式迭代，栈深度 BVH_STACK_SIZE（默认 32，支持 ~2^31 个图元）。
-  - 先测试近子节点，后测试远子节点（减少无效遍历）。
-  - 叶节点：对 primitive_indices[start:start+count] 中每个图元做精确求交。
-  - 图元 ID 编码：[0, n_spheres) 为球体，[n_spheres, n_spheres+n_triangles) 为三角形。
-
-节点编码：
-  - count == 0：内部节点，左子 = nodes[start_index]，右子 = nodes[start_index+1]
-  - count > 0 ：叶节点，图元在 primitive_indices[start_index : start_index+count]
-"""
-
-import taichi as ti
 import numpy as np
+import taichi as ti
 
 from src.constants import BVH_STACK_SIZE, MAX_PRIMS_LEAF, T_MAX
+
+SAH_BINS = 16
+SAH_MAX_LEAF = 8
+
+
+def _surface_area(bmin, bmax):
+    e = np.maximum(bmax - bmin, 0.0)
+    return 2.0 * (e[0] * e[1] + e[1] * e[2] + e[2] * e[0])
 
 
 @ti.data_oriented
 class BVHSystem:
-
-    def __init__(self, max_nodes: int = 524288):  # 2^19 = 512K，足够覆盖数十万三角形
+    def __init__(self, max_nodes: int = 524288):
         self._max_nodes = max_nodes
-        # 节点结构（AoS，每线程通常访问同一节点的多个字段）
-        BVHNode = ti.types.struct(
-            bbox_min    = ti.types.vector(3, ti.f32),
-            bbox_max    = ti.types.vector(3, ti.f32),
-            start_index = ti.i32,   # 内部节点：左子 ID；叶节点：图元索引表偏移
-            count       = ti.i32,   # 0 = 内部节点；>0 = 叶节点图元数
-        )
-        self.nodes = BVHNode.field(shape=(max_nodes,))
-        # 图元索引重排表（BVH 叶节点引用）
-        self.prim_ids = ti.field(ti.i32, shape=(max_nodes * 2,))
-        # 运行时只读标量
-        self.root_id   = ti.field(ti.i32, shape=())
+        self.nodes = None
+        self.prim_ids = None
+        self.root_id = ti.field(ti.i32, shape=())
         self.n_spheres = ti.field(ti.i32, shape=())
-        self.root_id[None]   = -1
-        self.n_spheres[None] = 0
+        self._node_count = 0
+        self._prim_count = 0
+        # Python 常量，会在 Taichi 特化 kernel 时决定线程局部栈长度。
+        # profile_renderer.py 可在首次编译前覆盖它，用于验证寄存器压力。
+        self.stack_capacity = BVH_STACK_SIZE
+        self.max_depth = 0
+        self.leaf_count = 0
+        self.max_leaf_size = 0
+        self.avg_leaf_size = 0.0
 
-    # ------------------------------------------------------------------
-    # Python 端：构建 BVH
-    # ------------------------------------------------------------------
-
-    def build(self, sphere_bboxes, triangle_bboxes, n_spheres: int, n_triangles: int):
-        """
-        在 CPU 上构建 BVH，然后上传到 Taichi field。
-
-        sphere_bboxes   : (n_sph, 3) × 2  tuple(bbox_min, bbox_max)
-        triangle_bboxes : (n_tri, 3) × 2  tuple(bbox_min, bbox_max)
-        """
-        # 合并所有图元（球体优先，三角形次之）
-        all_mins, all_maxs, all_ids = [], [], []
+    def build(self, sphere_bboxes, triangle_bboxes,
+              n_spheres: int, n_triangles: int):
         sph_min, sph_max = sphere_bboxes
-        for i in range(n_spheres):
-            all_mins.append(sph_min[i])
-            all_maxs.append(sph_max[i])
-            all_ids.append(i)                       # sphere ID: [0, n_spheres)
-
         tri_min, tri_max = triangle_bboxes
-        for i in range(n_triangles):
-            all_mins.append(tri_min[i])
-            all_maxs.append(tri_max[i])
-            all_ids.append(n_spheres + i)          # triangle ID: [n_spheres, ...)
-
-        if not all_ids:
+        mins = np.concatenate((sph_min, tri_min), axis=0).astype(np.float32)
+        maxs = np.concatenate((sph_max, tri_max), axis=0).astype(np.float32)
+        total = n_spheres + n_triangles
+        if total == 0:
+            self._allocate_fields(1, 1)
+            self.root_id[None] = -1
+            self.n_spheres[None] = 0
             return
+        assert total * 2 - 1 <= self._max_nodes, \
+            f"BVH 最坏情况节点数超过容量 {self._max_nodes}"
 
-        primitives = [
-            {
-                'bmin'  : np.array(all_mins[i], np.float32),
-                'bmax'  : np.array(all_maxs[i], np.float32),
-                'center': (np.array(all_mins[i]) + np.array(all_maxs[i])) * 0.5,
-                'id'    : all_ids[i],
-            }
-            for i in range(len(all_ids))
-        ]
-
-        # Python 端节点/图元列表（之后批量上传）
-        self._py_nodes    = []
+        centers = (mins + maxs) * np.float32(0.5)
+        ids = np.arange(total, dtype=np.int32)
+        self._py_nodes = []
         self._py_prim_ids = []
-        self._node_count  = 0
-        self._prim_count  = 0
-
+        self._node_count = self._prim_count = 0
         root = self._alloc_node()
-        self._build_recursive(root, primitives, 0, len(primitives), depth=0)
+        self._build_recursive(root, ids, mins, maxs, centers, 0)
+        leaves = [n['count'] for n in self._py_nodes if n['count'] > 0]
+        self.leaf_count = len(leaves)
+        self.max_leaf_size = max(leaves, default=0)
+        self.avg_leaf_size = float(np.mean(leaves)) if leaves else 0.0
         self._upload()
-
-        self.root_id[None]   = root
+        self.root_id[None] = root
         self.n_spheres[None] = n_spheres
-        print(f"[BVH] 构建完成：{self._node_count} 节点，{len(all_ids)} 图元")
+        print(f"[BVH] binned-SAH 构建完成：{self._node_count} 节点，{total} 图元，"
+              f"最大深度={self.max_depth}，叶节点={self.leaf_count}，"
+              f"平均/最大叶大小={self.avg_leaf_size:.2f}/{self.max_leaf_size}")
 
-    def _alloc_node(self) -> int:
-        assert self._node_count < self._max_nodes, "BVH 节点数超出最大值"
-        self._py_nodes.append({'bmin': np.zeros(3, np.float32),
-                                'bmax': np.zeros(3, np.float32),
-                                'start': 0, 'count': 0})
+    def _allocate_fields(self, node_capacity, prim_capacity):
+        node_type = ti.types.struct(
+            bbox_min=ti.types.vector(3, ti.f32),
+            bbox_max=ti.types.vector(3, ti.f32),
+            start_index=ti.i32,
+            count=ti.i32,
+        )
+        self.nodes = node_type.field(shape=(max(node_capacity, 1),))
+        self.prim_ids = ti.field(ti.i32, shape=(max(prim_capacity, 1),))
+
+    def _alloc_node(self):
         idx = self._node_count
         self._node_count += 1
+        self._py_nodes.append({'bmin': np.zeros(3, np.float32),
+                               'bmax': np.zeros(3, np.float32),
+                               'start': 0, 'count': 0})
         return idx
 
-    def _build_recursive(self, node_idx, prims, start, end, depth):
-        if start >= end:
+    def _choose_split(self, ids, mins, maxs, centers, parent_min, parent_max):
+        centroid_min = centers[ids].min(axis=0)
+        centroid_max = centers[ids].max(axis=0)
+        best_cost, best_axis, best_bin = np.inf, -1, -1
+        for axis in range(3):
+            extent = float(centroid_max[axis] - centroid_min[axis])
+            if extent <= 1e-12:
+                continue
+            buckets = np.minimum(
+                ((centers[ids, axis] - centroid_min[axis])
+                 * (SAH_BINS / extent)).astype(np.int32), SAH_BINS - 1)
+            counts = np.bincount(buckets, minlength=SAH_BINS).astype(np.int32)
+            bin_min = np.full((SAH_BINS, 3), np.inf, np.float32)
+            bin_max = np.full((SAH_BINS, 3), -np.inf, np.float32)
+            for local, bucket in enumerate(buckets):
+                pid = ids[local]
+                bin_min[bucket] = np.minimum(bin_min[bucket], mins[pid])
+                bin_max[bucket] = np.maximum(bin_max[bucket], maxs[pid])
+            lc = np.zeros(SAH_BINS - 1, np.int32)
+            rc = np.zeros(SAH_BINS - 1, np.int32)
+            la = np.zeros(SAH_BINS - 1, np.float64)
+            ra = np.zeros(SAH_BINS - 1, np.float64)
+            bmin, bmax, running = np.full(3, np.inf), np.full(3, -np.inf), 0
+            for i in range(SAH_BINS - 1):
+                if counts[i]:
+                    bmin = np.minimum(bmin, bin_min[i])
+                    bmax = np.maximum(bmax, bin_max[i])
+                running += counts[i]
+                lc[i] = running
+                la[i] = _surface_area(bmin, bmax) if running else 0.0
+            bmin, bmax, running = np.full(3, np.inf), np.full(3, -np.inf), 0
+            for i in range(SAH_BINS - 1, 0, -1):
+                if counts[i]:
+                    bmin = np.minimum(bmin, bin_min[i])
+                    bmax = np.maximum(bmax, bin_max[i])
+                running += counts[i]
+                rc[i - 1] = running
+                ra[i - 1] = _surface_area(bmin, bmax) if running else 0.0
+            costs = lc * la + rc * ra
+            split = int(np.argmin(costs))
+            if costs[split] < best_cost:
+                best_cost, best_axis, best_bin = float(costs[split]), axis, split
+
+        leaf_cost = len(ids) * max(_surface_area(parent_min, parent_max), 1e-20)
+        if best_axis < 0 or (best_cost >= leaf_cost and len(ids) <= SAH_MAX_LEAF):
+            return None
+        lo = float(centroid_min[best_axis])
+        extent = float(centroid_max[best_axis] - centroid_min[best_axis])
+        buckets = np.minimum(
+            ((centers[ids, best_axis] - lo) * (SAH_BINS / extent)).astype(np.int32),
+            SAH_BINS - 1)
+        left, right = ids[buckets <= best_bin], ids[buckets > best_bin]
+        if len(left) == 0 or len(right) == 0:
+            # Degenerate centroids: balanced median split keeps stack depth bounded.
+            axis = int(np.argmax(centroid_max - centroid_min))
+            ordered = ids[np.argsort(centers[ids, axis], kind='stable')]
+            mid = len(ordered) // 2
+            left, right = ordered[:mid], ordered[mid:]
+        return (left, right) if len(left) and len(right) else None
+
+    def _build_recursive(self, node_idx, ids, mins, maxs, centers, depth):
+        self.max_depth = max(self.max_depth, depth)
+        bmin, bmax = mins[ids].min(axis=0), maxs[ids].max(axis=0)
+        leaf = len(ids) <= MAX_PRIMS_LEAF or depth >= BVH_STACK_SIZE - 2
+        split = None if leaf else self._choose_split(ids, mins, maxs, centers, bmin, bmax)
+        if leaf or split is None:
+            offset = self._prim_count
+            self._py_prim_ids.extend(ids.tolist())
+            self._prim_count += len(ids)
+            self._py_nodes[node_idx] = {'bmin': bmin, 'bmax': bmax,
+                                        'start': offset, 'count': len(ids)}
             return
-
-        # 计算当前子集的 AABB
-        bmin = np.minimum.reduce([p['bmin'] for p in prims[start:end]])
-        bmax = np.maximum.reduce([p['bmax'] for p in prims[start:end]])
-
-        # 叶节点条件：图元数 ≤ MAX_PRIMS_LEAF 或深度过大（防止退化场景栈溢出）
-        if (end - start) <= MAX_PRIMS_LEAF or depth >= BVH_STACK_SIZE - 2:
-            prim_offset = self._prim_count
-            for i in range(start, end):
-                self._py_prim_ids.append(prims[i]['id'])
-                self._prim_count += 1
-            self._py_nodes[node_idx] = {
-                'bmin': bmin, 'bmax': bmax,
-                'start': prim_offset, 'count': end - start,
-            }
-            return
-
-        # 按最长轴中点划分
-        extent = bmax - bmin
-        axis = int(np.argmax(extent))
-        prims[start:end] = sorted(prims[start:end], key=lambda p: p['center'][axis])
-        mid = start + (end - start) // 2
-
-        # 先分配两个子节点（保证 right = left + 1）
-        left  = self._alloc_node()
+        left_ids, right_ids = split
+        left = self._alloc_node()
         right = self._alloc_node()
-        self._build_recursive(left,  prims, start, mid, depth + 1)
-        self._build_recursive(right, prims, mid,   end, depth + 1)
-
-        self._py_nodes[node_idx] = {
-            'bmin': bmin, 'bmax': bmax,
-            'start': left,   # right = left + 1（由分配顺序保证）
-            'count': 0,
-        }
+        self._build_recursive(left, left_ids, mins, maxs, centers, depth + 1)
+        self._build_recursive(right, right_ids, mins, maxs, centers, depth + 1)
+        self._py_nodes[node_idx] = {'bmin': bmin, 'bmax': bmax,
+                                    'start': left, 'count': 0}
 
     def _upload(self):
-        """将 Python 端数据批量上传到 Taichi field。"""
-        n  = self._node_count
-        np_ = self._prim_count
-
-        # 节点字段
-        bmin_arr  = np.stack([nd['bmin']  for nd in self._py_nodes]).astype(np.float32)
-        bmax_arr  = np.stack([nd['bmax']  for nd in self._py_nodes]).astype(np.float32)
-        start_arr = np.array([nd['start'] for nd in self._py_nodes], np.int32)
-        count_arr = np.array([nd['count'] for nd in self._py_nodes], np.int32)
-
-        # 用零填充到 max_nodes
-        def _pad3(arr):
-            out = np.zeros((self._max_nodes, 3), np.float32)
-            out[:n] = arr
-            return out
-        def _pad1i(arr, max_n):
-            out = np.zeros(max_n, np.int32)
-            out[:len(arr)] = arr
-            return out
-
-        self.nodes.bbox_min.from_numpy(_pad3(bmin_arr))
-        self.nodes.bbox_max.from_numpy(_pad3(bmax_arr))
-        self.nodes.start_index.from_numpy(_pad1i(start_arr, self._max_nodes))
-        self.nodes.count.from_numpy(_pad1i(count_arr, self._max_nodes))
-
-        pid_arr = np.array(self._py_prim_ids, np.int32)
-        pid_out = np.zeros(self._max_nodes * 2, np.int32)
-        pid_out[:np_] = pid_arr
-        self.prim_ids.from_numpy(pid_out)
-
-    # ------------------------------------------------------------------
-    # Taichi 作用域：BVH 遍历
-    # ------------------------------------------------------------------
+        self._allocate_fields(self._node_count, self._prim_count)
+        self.nodes.bbox_min.from_numpy(np.stack(
+            [n['bmin'] for n in self._py_nodes]).astype(np.float32))
+        self.nodes.bbox_max.from_numpy(np.stack(
+            [n['bmax'] for n in self._py_nodes]).astype(np.float32))
+        self.nodes.start_index.from_numpy(np.asarray(
+            [n['start'] for n in self._py_nodes], np.int32))
+        self.nodes.count.from_numpy(np.asarray(
+            [n['count'] for n in self._py_nodes], np.int32))
+        self.prim_ids.from_numpy(np.asarray(self._py_prim_ids, np.int32))
 
     @ti.func
     def intersect(self, ray_origin, ray_dir, t_min: ti.f32, t_max: ti.f32,
                   sphere_sys: ti.template(), tri_sys: ti.template()):
-        """
-        BVH 栈式迭代遍历求交。
-        返回 (hit_t, hit_pos, hit_normal, hit_uv, hit_mat, front_face)。
-        未命中时 hit_t == t_max，hit_mat == -1。
-        """
-        closest_t  = t_max
-        hit_pos    = ti.Vector([0.0, 0.0, 0.0])
-        hit_normal = ti.Vector([0.0, 0.0, 0.0])
-        hit_tan    = ti.Vector([0.0, 0.0, 0.0, 1.0])
-        hit_uv     = ti.Vector([0.0, 0.0])
-        hit_mat    = -1
-        front      = True
-
-        # 每线程独立栈（Taichi GPU 上为线程私有局部变量）
-        stack      = ti.Vector([0] * BVH_STACK_SIZE, dt=ti.i32)
-        stack_top  = 0
-        stack[stack_top] = self.root_id[None]
-        stack_top += 1
-
+        closest_t, closest_pid = t_max, -1
+        closest_u, closest_v = 0.0, 0.0
+        inv_dir = 1.0 / ray_dir
+        stack = ti.Vector([0] * self.stack_capacity, dt=ti.i32)
+        stack_top = 0
+        if self.root_id[None] >= 0:
+            stack[0], stack_top = self.root_id[None], 1
         n_sph = self.n_spheres[None]
-
         while stack_top > 0:
             stack_top -= 1
-            node_idx = stack[stack_top]
-            node     = self.nodes[node_idx]
-
+            node = self.nodes[stack[stack_top]]
             if node.count > 0:
-                # 叶节点：精确求交
                 for k in range(node.start_index, node.start_index + node.count):
                     pid = self.prim_ids[k]
-                    # 必须先初始化，Taichi 不允许在分支内首次定义变量
-                    t   = closest_t
-                    pos = ti.Vector([0.0, 0.0, 0.0])
-                    nrm = ti.Vector([0.0, 0.0, 0.0])
-                    tan = ti.Vector([0.0, 0.0, 0.0, 1.0])
-                    uv  = ti.Vector([0.0, 0.0])
-                    mat = -1
-                    fr  = True
+                    hit_t, hit_u, hit_v = closest_t, 0.0, 0.0
                     if pid < n_sph:
-                        t, pos, nrm, tan, uv, mat, fr = sphere_sys.hit(pid, ray_origin, ray_dir, t_min, closest_t)
+                        hit_t = sphere_sys.hit_raw(pid, ray_origin, ray_dir, t_min, closest_t)
                     else:
-                        t, pos, nrm, tan, uv, mat, fr = tri_sys.hit(pid - n_sph, ray_origin, ray_dir, t_min, closest_t)
-                    if t < closest_t:
-                        closest_t  = t
-                        hit_pos    = pos
-                        hit_normal = nrm
-                        hit_tan    = tan
-                        hit_uv     = uv
-                        hit_mat    = mat
-                        front      = fr
+                        hit_t, hit_u, hit_v = tri_sys.hit_raw(
+                            pid - n_sph, ray_origin, ray_dir, t_min, closest_t)
+                    if hit_t < closest_t:
+                        closest_t, closest_pid = hit_t, pid
+                        closest_u, closest_v = hit_u, hit_v
             else:
-                # 内部节点：AABB 测试决定是否压栈
-                left  = node.start_index
-                right = left + 1
-                dl = _ray_aabb(ray_origin, ray_dir, self.nodes[left].bbox_min,  self.nodes[left].bbox_max,  t_min, closest_t)
-                dr = _ray_aabb(ray_origin, ray_dir, self.nodes[right].bbox_min, self.nodes[right].bbox_max, t_min, closest_t)
-
-                # 先处理近子节点（后压栈 = 先出栈）
+                left, right = node.start_index, node.start_index + 1
+                dl = _ray_aabb_inv(ray_origin, inv_dir, self.nodes[left].bbox_min,
+                                   self.nodes[left].bbox_max, t_min, closest_t)
+                dr = _ray_aabb_inv(ray_origin, inv_dir, self.nodes[right].bbox_min,
+                                   self.nodes[right].bbox_max, t_min, closest_t)
                 if dl < dr:
-                    if dr < closest_t and stack_top < BVH_STACK_SIZE - 1:
-                        stack[stack_top] = right;  stack_top += 1
-                    if dl < closest_t and stack_top < BVH_STACK_SIZE - 1:
-                        stack[stack_top] = left;   stack_top += 1
+                    if dr < closest_t and stack_top < self.stack_capacity:
+                        stack[stack_top], stack_top = right, stack_top + 1
+                    if dl < closest_t and stack_top < self.stack_capacity:
+                        stack[stack_top], stack_top = left, stack_top + 1
                 else:
-                    if dl < closest_t and stack_top < BVH_STACK_SIZE - 1:
-                        stack[stack_top] = left;   stack_top += 1
-                    if dr < closest_t and stack_top < BVH_STACK_SIZE - 1:
-                        stack[stack_top] = right;  stack_top += 1
+                    if dl < closest_t and stack_top < self.stack_capacity:
+                        stack[stack_top], stack_top = left, stack_top + 1
+                    if dr < closest_t and stack_top < self.stack_capacity:
+                        stack[stack_top], stack_top = right, stack_top + 1
 
+        hit_pos = ti.Vector([0.0, 0.0, 0.0])
+        hit_normal = ti.Vector([0.0, 0.0, 0.0])
+        hit_tan = ti.Vector([0.0, 0.0, 0.0, 1.0])
+        hit_uv = ti.Vector([0.0, 0.0])
+        hit_mat, front = -1, True
+        if closest_pid >= 0:
+            if closest_pid < n_sph:
+                hit_pos, hit_normal, hit_tan, hit_uv, hit_mat, front = \
+                    sphere_sys.resolve_hit(closest_pid, ray_origin, ray_dir, closest_t)
+            else:
+                hit_pos, hit_normal, hit_tan, hit_uv, hit_mat, front = \
+                    tri_sys.resolve_hit(closest_pid - n_sph, ray_origin, ray_dir,
+                                        closest_t, closest_u, closest_v)
         return closest_t, hit_pos, hit_normal, hit_tan, hit_uv, hit_mat, front
+
+    @ti.func
+    def occluded(self, ray_origin, ray_dir, t_min: ti.f32, t_max: ti.f32,
+                 sphere_sys: ti.template(), tri_sys: ti.template()):
+        blocked = 0
+        inv_dir = 1.0 / ray_dir
+        stack = ti.Vector([0] * self.stack_capacity, dt=ti.i32)
+        stack_top = 0
+        if self.root_id[None] >= 0:
+            stack[0], stack_top = self.root_id[None], 1
+        n_sph = self.n_spheres[None]
+        while stack_top > 0 and blocked == 0:
+            stack_top -= 1
+            node = self.nodes[stack[stack_top]]
+            if node.count > 0:
+                for k in range(node.start_index, node.start_index + node.count):
+                    if blocked == 0:
+                        pid = self.prim_ids[k]
+                        hit_t = t_max
+                        if pid < n_sph:
+                            hit_t = sphere_sys.hit_raw(pid, ray_origin, ray_dir, t_min, t_max)
+                        else:
+                            hit_t, hit_u, hit_v = tri_sys.hit_raw(
+                                pid - n_sph, ray_origin, ray_dir, t_min, t_max)
+                        if hit_t < t_max:
+                            blocked = 1
+            else:
+                left, right = node.start_index, node.start_index + 1
+                dl = _ray_aabb_inv(ray_origin, inv_dir, self.nodes[left].bbox_min,
+                                   self.nodes[left].bbox_max, t_min, t_max)
+                dr = _ray_aabb_inv(ray_origin, inv_dir, self.nodes[right].bbox_min,
+                                   self.nodes[right].bbox_max, t_min, t_max)
+                if dl < dr:
+                    if dr < t_max and stack_top < self.stack_capacity:
+                        stack[stack_top], stack_top = right, stack_top + 1
+                    if dl < t_max and stack_top < self.stack_capacity:
+                        stack[stack_top], stack_top = left, stack_top + 1
+                else:
+                    if dl < t_max and stack_top < self.stack_capacity:
+                        stack[stack_top], stack_top = left, stack_top + 1
+                    if dr < t_max and stack_top < self.stack_capacity:
+                        stack[stack_top], stack_top = right, stack_top + 1
+        return blocked
 
 
 @ti.func
-def _ray_aabb(ray_origin, ray_dir, bbox_min, bbox_max, t_min: ti.f32, t_max: ti.f32) -> ti.f32:
-    """Slab 法光线-AABB 相交测试，返回入交距离，未命中返回 T_MAX。"""
-    inv_dir = 1.0 / ray_dir
+def _ray_aabb_inv(ray_origin, inv_dir, bbox_min, bbox_max,
+                  t_min: ti.f32, t_max: ti.f32):
     t0 = (bbox_min - ray_origin) * inv_dir
     t1 = (bbox_max - ray_origin) * inv_dir
-    t_small = ti.min(t0, t1)
-    t_large = ti.max(t0, t1)
-    t_near  = ti.max(t_small[0], t_small[1], t_small[2], t_min)
-    t_far   = ti.min(t_large[0], t_large[1], t_large[2], t_max)
-    result  = T_MAX
-    if t_near <= t_far:
-        result = t_near
+    lo, hi = ti.min(t0, t1), ti.max(t0, t1)
+    near = ti.max(lo[0], lo[1], lo[2], t_min)
+    far = ti.min(hi[0], hi[1], hi[2], t_max)
+    result = T_MAX
+    if near <= far:
+        result = near
     return result

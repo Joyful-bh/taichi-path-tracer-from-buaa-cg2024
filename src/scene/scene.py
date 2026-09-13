@@ -147,7 +147,7 @@ class Scene:
                        self.spheres.count,
                        self.triangles.count)
 
-        self.light_sampler.build(self.triangles, self.materials)
+        self.light_sampler.build(self.spheres, self.triangles, self.materials)
 
         self._baked = True
         n_total = self.spheres.count + self.triangles.count
@@ -168,6 +168,12 @@ class Scene:
         """
         return self.bvh.intersect(ray_origin, ray_dir, t_min, t_max,
                                    self.spheres, self.triangles)
+
+    @ti.func
+    def occluded(self, ray_origin, ray_dir, t_min: ti.f32, t_max: ti.f32):
+        """阴影射线专用 any-hit 查询，不生成表面着色属性。"""
+        return self.bvh.occluded(ray_origin, ray_dir, t_min, t_max,
+                                 self.spheres, self.triangles)
 
     @ti.func
     def background(self, ray_dir):

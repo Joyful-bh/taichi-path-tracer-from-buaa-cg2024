@@ -98,6 +98,9 @@ class RenderConfig:
         'samples_per_batch', 'adaptive_enabled', 'adaptive_min_spp',
         'adaptive_max_spp', 'adaptive_check_interval',
         'adaptive_relative_error', 'adaptive_absolute_error', 'save_aovs',
+        'denoise_enabled', 'denoise_executable', 'denoise_device',
+        'denoise_quality', 'denoise_use_albedo', 'denoise_use_normal',
+        'denoise_save_noisy', 'denoise_output',
     ]
 
     def __init__(self, d: dict):
@@ -109,8 +112,18 @@ class RenderConfig:
         self.output     = str(d.get('output',    'output.png'))
         self.samples_per_batch = max(1, int(d.get('samples_per_batch', 16)))
         self.save_aovs = bool(d.get('save_aovs', False))
+        denoise = d.get('denoising', {})
+        self.denoise_enabled = bool(denoise.get('enabled', False))
+        self.denoise_executable = str(denoise.get('executable', 'auto'))
+        self.denoise_device = str(denoise.get('device', 'default'))
+        self.denoise_quality = str(denoise.get('quality', 'high'))
+        self.denoise_use_albedo = bool(denoise.get('use_albedo', True))
+        self.denoise_use_normal = bool(denoise.get('use_normal', True))
+        self.denoise_save_noisy = bool(denoise.get('save_noisy', True))
+        output = denoise.get('output', None)
+        self.denoise_output = None if output in (None, '') else str(output)
         adaptive = d.get('adaptive_sampling', {})
-        self.adaptive_enabled = bool(adaptive.get('enabled', True))
+        self.adaptive_enabled = bool(adaptive.get('enabled', False))
         self.adaptive_min_spp = max(2, int(adaptive.get('min_spp', 64)))
         self.adaptive_max_spp = max(self.adaptive_min_spp,
                                     int(adaptive.get('max_spp', self.spp)))

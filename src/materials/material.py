@@ -62,7 +62,7 @@ class MaterialSystem:
 
     def __init__(self, max_materials: int = 512):
         self._max   = max_materials
-        self.mats   = _MatStruct.field(shape=(max_materials,))
+        self.mats   = None
         self._count = 0
         # Python 端缓冲
         self._buf = {
@@ -148,23 +148,35 @@ class MaterialSystem:
     def bake(self):
         """上传所有材质到 GPU。在渲染前调用一次。"""
         n = self._count
-        if n == 0:
-            return
+        capacity = max(n, 1)
+        self.mats = _MatStruct.field(shape=(capacity,))
         b = self._buf
-        for i in range(n):
-            self.mats[i].mat_type        = b['mat_type'][i]
-            self.mats[i].albedo          = ti.Vector(b['albedo'][i].tolist())
-            self.mats[i].emit            = ti.Vector(b['emit'][i].tolist())
-            self.mats[i].fuzz            = b['fuzz'][i]
-            self.mats[i].ior             = b['ior'][i]
-            self.mats[i].roughness       = b['roughness'][i]
-            self.mats[i].spec_prob       = b['spec_prob'][i]
-            self.mats[i].backcull        = b['backcull'][i]
-            self.mats[i].albedo_tex_id   = b['albedo_tex_id'][i]
-            self.mats[i].normal_tex_id   = b['normal_tex_id'][i]
-            self.mats[i].mr_tex_id       = b['mr_tex_id'][i]
-            self.mats[i].emissive_tex_id = b['emissive_tex_id'][i]
-            self.mats[i].emissive_factor = ti.Vector(b['emissive_factor'][i].tolist())
+
+        def scalar(name, dtype):
+            out = np.zeros(capacity, dtype)
+            if n:
+                out[:n] = np.asarray(b[name], dtype=dtype)
+            return out
+
+        def vector(name):
+            out = np.zeros((capacity, 3), np.float32)
+            if n:
+                out[:n] = np.stack(b[name]).astype(np.float32)
+            return out
+
+        self.mats.mat_type.from_numpy(scalar('mat_type', np.int32))
+        self.mats.albedo.from_numpy(vector('albedo'))
+        self.mats.emit.from_numpy(vector('emit'))
+        self.mats.fuzz.from_numpy(scalar('fuzz', np.float32))
+        self.mats.ior.from_numpy(scalar('ior', np.float32))
+        self.mats.roughness.from_numpy(scalar('roughness', np.float32))
+        self.mats.spec_prob.from_numpy(scalar('spec_prob', np.float32))
+        self.mats.backcull.from_numpy(scalar('backcull', np.int32))
+        self.mats.albedo_tex_id.from_numpy(scalar('albedo_tex_id', np.int32))
+        self.mats.normal_tex_id.from_numpy(scalar('normal_tex_id', np.int32))
+        self.mats.mr_tex_id.from_numpy(scalar('mr_tex_id', np.int32))
+        self.mats.emissive_tex_id.from_numpy(scalar('emissive_tex_id', np.int32))
+        self.mats.emissive_factor.from_numpy(vector('emissive_factor'))
         print(f"[Material] 已烘焙 {n} 个材质")
 
     @property
@@ -193,6 +205,7 @@ class MaterialSystem:
         emitted      = ti.Vector([0.0, 0.0, 0.0])
         should       = False
         is_specular  = False
+        scatter_pdf  = 0.0
 
         # 背面剔除：光线从背面命中且材质设置了 backcull，则穿透不散射
         if mat.backcull and not front_face:
@@ -203,6 +216,7 @@ class MaterialSystem:
             if mat.mat_type == MAT_LAMBERTIAN:
                 scattered, attenuation, should = _scatter_lambertian(normal, mat)
                 is_specular = False
+                scatter_pdf = ti.max(0.0, scattered.dot(normal)) / 3.141592653589793
             elif mat.mat_type == MAT_METAL:
                 scattered, attenuation, should = _scatter_metal(ray_dir, normal, mat)
                 is_specular = True
@@ -215,11 +229,14 @@ class MaterialSystem:
                 is_specular = False
             elif mat.mat_type == MAT_CLEARCOAT:
                 scattered, attenuation, should, is_specular = _scatter_clearcoat(ray_dir, normal, mat)
+                if not is_specular:
+                    scatter_pdf = (1.0 - mat.spec_prob) * \
+                                  ti.max(0.0, scattered.dot(normal)) / 3.141592653589793
             elif mat.mat_type == MAT_PBR:
-                scattered, attenuation, emitted, should, is_specular = _scatter_pbr(
+                scattered, attenuation, emitted, should, is_specular, scatter_pdf = _scatter_pbr(
                     ray_dir, normal, hit_uv, hit_tangent, mat, tex_sys)
 
-        return scattered, attenuation, emitted, should, is_specular
+        return scattered, attenuation, emitted, should, is_specular, scatter_pdf
 
 
 # ------------------------------------------------------------------
@@ -269,6 +286,7 @@ def _scatter_clearcoat(ray_dir, normal, mat):
     scat        = ti.Vector([0.0, 0.0, 0.0])
     att         = ti.Vector([1.0, 1.0, 1.0])
     is_specular = False
+    scatter_pdf = 0.0
     if ti.random() < mat.spec_prob:
         r    = reflect(ray_dir.normalized(), normal)
         scat = r + mat.roughness * random_in_unit_sphere()
@@ -359,6 +377,7 @@ def _scatter_pbr(ray_dir, normal, hit_uv, hit_tangent, mat, tex_sys: ti.template
     att         = ti.Vector([0.0, 0.0, 0.0])
     should      = True
     is_specular = False
+    scatter_pdf = 0.0
 
     if ti.random() < spec_prob:
         # ---- 镜面分支：GGX-D 重要性采样 H → L ----
@@ -392,5 +411,6 @@ def _scatter_pbr(ray_dir, normal, hit_uv, hit_tangent, mat, tex_sys: ti.template
         one  = ti.Vector([1.0, 1.0, 1.0])
         att  = albedo * (1.0 - metallic) * (one - F_v) * (1.0 / (1.0 - spec_prob))
         is_specular = False
+        scatter_pdf = (1.0 - spec_prob) * ti.max(0.0, scat.dot(shading_normal)) / 3.141592653589793
 
-    return scat, att, emitted, should, is_specular
+    return scat, att, emitted, should, is_specular, scatter_pdf

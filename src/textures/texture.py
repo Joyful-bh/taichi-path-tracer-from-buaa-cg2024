@@ -38,9 +38,9 @@ class TextureSystem:
     def __init__(self, max_textures: int = MAX_TEXTURES, tex_size: int = TEX_SIZE):
         self._max  = max_textures
         self._sz   = tex_size
-        # GPU 侧贴图数组：(max_textures, tex_size, tex_size) 个 RGB float32 像素
-        self.textures = ti.Vector.field(3, ti.f32,
-                                        shape=(max_textures, tex_size, tex_size))
+        self._gpu_sz = tex_size
+        # GPU 字段在 bake() 时按实际纹理数分配。
+        self.textures = None
         # Python 侧缓存
         self._buf   = []   # list of (tex_size, tex_size, 3) float32 numpy arrays
         self._count = 0
@@ -77,11 +77,12 @@ class TextureSystem:
         将所有 Python 端缓存的贴图上传至 GPU。
         必须在 ti.init() 之后、渲染 kernel 调用之前执行。
         """
-        if self._count == 0:
-            return
-
-        # 构建完整的 (max_textures, tex_size, tex_size, 3) 数组
-        full = np.zeros((self._max, self._sz, self._sz, 3), dtype=np.float32)
+        capacity = max(self._count, 1)
+        self._gpu_sz = self._sz if self._count else 1
+        self.textures = ti.Vector.field(
+            3, ti.f32, shape=(capacity, self._gpu_sz, self._gpu_sz))
+        # 只上传实际纹理容量；空场景保留一个有效占位层。
+        full = np.zeros((capacity, self._gpu_sz, self._gpu_sz, 3), dtype=np.float32)
         for i, arr in enumerate(self._buf):
             full[i] = arr   # arr shape: (sz, sz, 3)
 
@@ -110,14 +111,14 @@ class TextureSystem:
             vw = v - ti.floor(v)
 
             # 映射到像素坐标（连续坐标，浮点）
-            sz_f  = float(self._sz)
+            sz_f  = float(self._gpu_sz)
             px    = uw * (sz_f - 1.0)
             py    = vw * (sz_f - 1.0)
 
             x0 = int(ti.floor(px))
             y0 = int(ti.floor(py))
-            x1 = ti.min(x0 + 1, self._sz - 1)
-            y1 = ti.min(y0 + 1, self._sz - 1)
+            x1 = ti.min(x0 + 1, self._gpu_sz - 1)
+            y1 = ti.min(y0 + 1, self._gpu_sz - 1)
 
             fx = px - ti.floor(px)
             fy = py - ti.floor(py)

@@ -77,7 +77,10 @@ def main():
     # 4. 创建渲染器
     # ----------------------------------------------------------------
     from src.renderer.path_tracer import PathTracer
-    renderer = PathTracer(cfg.width, cfg.height)
+    needs_aovs = cfg.save_aovs or cfg.denoise_enabled
+    renderer = PathTracer(cfg.width, cfg.height,
+                          enable_aovs=needs_aovs,
+                          enable_adaptive=cfg.adaptive_enabled)
 
     adaptive_label = "开启" if cfg.adaptive_enabled else "关闭"
     print(f"[Main] 分辨率 {cfg.width}×{cfg.height}，模式={args.mode}，"
@@ -104,7 +107,8 @@ def _run_offline(renderer, camera, scene, cfg):
         batch = min(cfg.samples_per_batch, cfg.spp - renderer.spp)
         renderer.render_batch(camera, scene, scene.materials, scene.tex_sys,
                               scene.light_sampler, cfg.max_bounce, batch,
-                              cfg.adaptive_enabled, cfg.spp)
+                              cfg.adaptive_enabled, cfg.spp,
+                              cfg.save_aovs or cfg.denoise_enabled)
         if cfg.adaptive_enabled and renderer.spp >= cfg.adaptive_min_spp and (
                 renderer.spp % cfg.adaptive_check_interval < batch or renderer.spp >= cfg.spp):
             renderer.update_convergence(
@@ -122,9 +126,27 @@ def _run_offline(renderer, camera, scene, cfg):
 
     print()
     img = renderer.get_image()   # (H, W, 3) linear HDR
-    save_image(img, cfg.output)
+    aovs = renderer.get_aovs() if (cfg.save_aovs or cfg.denoise_enabled) else None
+    if cfg.denoise_enabled:
+        from src.io.oidn_denoiser import denoise_oidn, denoised_output_path
+        denoised_path = denoised_output_path(cfg.output, cfg.denoise_output)
+        if cfg.denoise_save_noisy:
+            save_image(img, cfg.output)
+        print(f"[OIDN] 开始降噪：device={cfg.denoise_device}，quality={cfg.denoise_quality}")
+        denoised = denoise_oidn(
+            img,
+            albedo=aovs['albedo'] if cfg.denoise_use_albedo else None,
+            normal=aovs['normal'] if cfg.denoise_use_normal else None,
+            executable=cfg.denoise_executable,
+            device=cfg.denoise_device,
+            quality=cfg.denoise_quality,
+        )
+        save_image(denoised, denoised_path)
+        print(f"[OIDN] 已完成：{denoised_path}")
+    else:
+        save_image(img, cfg.output)
     if cfg.save_aovs:
-        save_aovs(renderer.get_aovs(), cfg.output)
+        save_aovs(aovs, cfg.output)
     print(f"[Main] 渲染完成，总耗时 {time.time() - t0:.1f}s")
 
 
@@ -152,7 +174,8 @@ def _run_preview(renderer, camera, scene, cfg):
         batch = min(cfg.samples_per_batch, spp_limit - renderer.spp)
         renderer.render_batch(camera, scene, scene.materials, scene.tex_sys,
                               scene.light_sampler, cfg.max_bounce, batch,
-                              cfg.adaptive_enabled, spp_limit)
+                              cfg.adaptive_enabled, spp_limit,
+                              cfg.save_aovs or cfg.denoise_enabled)
         if cfg.adaptive_enabled and renderer.spp >= cfg.adaptive_min_spp and (
                 renderer.spp % cfg.adaptive_check_interval < batch or renderer.spp >= spp_limit):
             renderer.update_convergence(
@@ -174,9 +197,24 @@ def _run_preview(renderer, camera, scene, cfg):
     # 渲染结束后保存图像，然后保持窗口直到手动关闭
     from src.io.image_output import save_image, save_aovs
     img = renderer.get_image()
-    save_image(img, cfg.output)
+    aovs = renderer.get_aovs() if (cfg.save_aovs or cfg.denoise_enabled) else None
+    if cfg.denoise_enabled:
+        from src.io.oidn_denoiser import denoise_oidn, denoised_output_path
+        if cfg.denoise_save_noisy:
+            save_image(img, cfg.output)
+        denoised = denoise_oidn(
+            img,
+            albedo=aovs['albedo'] if cfg.denoise_use_albedo else None,
+            normal=aovs['normal'] if cfg.denoise_use_normal else None,
+            executable=cfg.denoise_executable,
+            device=cfg.denoise_device,
+            quality=cfg.denoise_quality,
+        )
+        save_image(denoised, denoised_output_path(cfg.output, cfg.denoise_output))
+    else:
+        save_image(img, cfg.output)
     if cfg.save_aovs:
-        save_aovs(renderer.get_aovs(), cfg.output)
+        save_aovs(aovs, cfg.output)
 
     while window.running:
         canvas.set_image(display)

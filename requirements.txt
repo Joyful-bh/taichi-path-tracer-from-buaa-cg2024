@@ -5,3 +5,5 @@ trimesh>=4.0,<5
 Pillow>=10.0,<12
 imageio>=2.34,<3
 pytest>=8.0,<9
+
+# OIDN 降噪使用官方 oidnDenoise 2.x 原生程序，不是 Python 包；安装方法见 README。

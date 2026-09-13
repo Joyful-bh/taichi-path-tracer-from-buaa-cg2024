@@ -30,20 +30,27 @@ _PI = 3.14159265358979
 
 @ti.data_oriented
 class PathTracer:
-    def __init__(self, width: int, height: int):
+    def __init__(self, width: int, height: int,
+                 enable_aovs: bool = False, enable_adaptive: bool = False):
         self.width  = width
         self.height = height
+        self.enable_aovs = bool(enable_aovs)
+        self.enable_adaptive = bool(enable_adaptive)
         # 线性辐亮度累积缓冲（GPU 端，浮点精度）
         self.accumulator  = ti.Vector.field(3, ti.f32, shape=(width, height))
         self.sample_count = ti.field(ti.i32, shape=())
-        self.pixel_sample_count = ti.field(ti.i32, shape=(width, height))
-        self.converged = ti.field(ti.i32, shape=(width, height))
+        count_shape = (width, height) if self.enable_adaptive else (1, 1)
+        self.pixel_sample_count = ti.field(ti.i32, shape=count_shape)
+        adaptive_shape = (width, height) if self.enable_adaptive else (1, 1)
+        aux_shape = ((width, height)
+                     if self.enable_aovs or self.enable_adaptive else (1, 1))
+        self.converged = ti.field(ti.i32, shape=adaptive_shape)
         self.active_count = ti.field(ti.i32, shape=())
-        self.lum_mean = ti.field(ti.f32, shape=(width, height))
-        self.lum_m2 = ti.field(ti.f32, shape=(width, height))
-        self.aov_albedo = ti.Vector.field(3, ti.f32, shape=(width, height))
-        self.aov_normal = ti.Vector.field(3, ti.f32, shape=(width, height))
-        self.aov_depth = ti.field(ti.f32, shape=(width, height))
+        self.lum_mean = ti.field(ti.f32, shape=aux_shape)
+        self.lum_m2 = ti.field(ti.f32, shape=aux_shape)
+        self.aov_albedo = ti.Vector.field(3, ti.f32, shape=aux_shape)
+        self.aov_normal = ti.Vector.field(3, ti.f32, shape=aux_shape)
+        self.aov_depth = ti.field(ti.f32, shape=aux_shape)
         self.sample_count[None] = 0
         self.active_count[None] = width * height
 
@@ -52,14 +59,78 @@ class PathTracer:
     # ------------------------------------------------------------------
 
     @ti.kernel
-    def render_batch(self, camera: ti.template(), scene: ti.template(),
+    def _render_batch_fixed(self, camera: ti.template(), scene: ti.template(),
+                            mat_sys: ti.template(), tex_sys: ti.template(),
+                            light_sampler: ti.template(), max_bounce: ti.i32,
+                            samples_per_batch: ti.i32, max_spp: ti.i32):
+        """固定采样快速路径：整批在寄存器中累积，最后一次写回。"""
+        for px, py in self.accumulator:
+            color_sum = ti.Vector([0.0, 0.0, 0.0])
+            actual = ti.min(samples_per_batch, max_spp - self.sample_count[None])
+            for _ in range(actual):
+                s = (px + ti.random()) / self.width
+                t = (py + ti.random()) / self.height
+                ray_o, ray_d = camera.get_ray(s, t)
+                color, sample_albedo, sample_normal, sample_depth = self._ray_color(
+                    ray_o, ray_d, scene, mat_sys, tex_sys, light_sampler, max_bounce)
+                color_sum += color
+            self.accumulator[px, py] += color_sum
+        self.sample_count[None] = ti.min(
+            self.sample_count[None] + samples_per_batch, max_spp)
+
+    @ti.kernel
+    def _render_batch_fixed_aov(self, camera: ti.template(), scene: ti.template(),
+                                mat_sys: ti.template(), tex_sys: ti.template(),
+                                light_sampler: ti.template(), max_bounce: ti.i32,
+                                samples_per_batch: ti.i32, max_spp: ti.i32):
+        """固定采样 + AOV；所有缓冲均每批只写回一次。"""
+        for px, py in self.accumulator:
+            color_sum = ti.Vector([0.0, 0.0, 0.0])
+            albedo_sum = ti.Vector([0.0, 0.0, 0.0])
+            normal_sum = ti.Vector([0.0, 0.0, 0.0])
+            depth_sum = 0.0
+            batch_lum_mean = 0.0
+            batch_lum_m2 = 0.0
+            batch_n = 0
+            actual = ti.min(samples_per_batch, max_spp - self.sample_count[None])
+            for _ in range(actual):
+                s = (px + ti.random()) / self.width
+                t = (py + ti.random()) / self.height
+                ray_o, ray_d = camera.get_ray(s, t)
+                color, albedo, normal, depth = self._ray_color(
+                    ray_o, ray_d, scene, mat_sys, tex_sys, light_sampler, max_bounce)
+                color_sum += color
+                albedo_sum += albedo
+                normal_sum += normal
+                depth_sum += depth
+                batch_n += 1
+                luminance = color.dot(ti.Vector([0.2126, 0.7152, 0.0722]))
+                delta = luminance - batch_lum_mean
+                batch_lum_mean += delta / float(batch_n)
+                batch_lum_m2 += delta * (luminance - batch_lum_mean)
+            old_n = self.sample_count[None]
+            self.accumulator[px, py] += color_sum
+            self.aov_albedo[px, py] += albedo_sum
+            self.aov_normal[px, py] += normal_sum
+            self.aov_depth[px, py] += depth_sum
+            if actual > 0:
+                combined_n = old_n + actual
+                mean_delta = batch_lum_mean - self.lum_mean[px, py]
+                self.lum_m2[px, py] += batch_lum_m2 + mean_delta * mean_delta * \
+                    float(old_n) * float(actual) / float(combined_n)
+                self.lum_mean[px, py] += mean_delta * float(actual) / float(combined_n)
+        self.sample_count[None] = ti.min(
+            self.sample_count[None] + samples_per_batch, max_spp)
+
+    @ti.kernel
+    def _render_batch_adaptive(self, camera: ti.template(), scene: ti.template(),
                      mat_sys: ti.template(), tex_sys: ti.template(),
                      light_sampler: ti.template(), max_bounce: ti.i32,
-                     samples_per_batch: ti.i32, adaptive_enabled: ti.i32,
+                     samples_per_batch: ti.i32,
                      max_spp: ti.i32):
         """在一次 kernel 中为每个活跃像素累积多个样本。"""
         for px, py in self.accumulator:
-            if adaptive_enabled == 0 or self.converged[px, py] == 0:
+            if self.converged[px, py] == 0:
                 for _ in range(samples_per_batch):
                     if self.pixel_sample_count[px, py] < max_spp:
                         s = (px + ti.random()) / self.width
@@ -80,6 +151,27 @@ class PathTracer:
                         self.lum_m2[px, py] += delta * (luminance - self.lum_mean[px, py])
                         self.pixel_sample_count[px, py] = n
         self.sample_count[None] = ti.min(self.sample_count[None] + samples_per_batch, max_spp)
+
+    def render_batch(self, camera, scene, mat_sys, tex_sys, light_sampler,
+                     max_bounce, samples_per_batch, adaptive_enabled, max_spp,
+                     save_aovs=False):
+        """根据模式分派到编译期独立的 kernel，避免固定路径携带无用统计。"""
+        if adaptive_enabled:
+            if not self.enable_adaptive:
+                raise RuntimeError("PathTracer 创建时未启用自适应缓冲")
+            self._render_batch_adaptive(camera, scene, mat_sys, tex_sys,
+                                        light_sampler, max_bounce,
+                                        samples_per_batch, max_spp)
+        elif save_aovs:
+            if not self.enable_aovs:
+                raise RuntimeError("PathTracer 创建时未启用 AOV 缓冲")
+            self._render_batch_fixed_aov(camera, scene, mat_sys, tex_sys,
+                                         light_sampler, max_bounce,
+                                         samples_per_batch, max_spp)
+        else:
+            self._render_batch_fixed(camera, scene, mat_sys, tex_sys,
+                                     light_sampler, max_bounce,
+                                     samples_per_batch, max_spp)
 
     def render_sample(self, camera, scene, mat_sys, tex_sys, light_sampler, max_bounce):
         """向后兼容的单样本接口。"""
@@ -127,19 +219,28 @@ class PathTracer:
         row 0 对应图像顶部（标准图像坐标）。
         调用方负责色调映射和 gamma 校正（见 io/image_output.py）。
         """
-        counts = np.maximum(self.pixel_sample_count.to_numpy(), 1)[..., None]
-        img = self.accumulator.to_numpy() / counts
+        if self.enable_adaptive:
+            counts = np.maximum(self.pixel_sample_count.to_numpy(), 1)[..., None]
+            img = self.accumulator.to_numpy() / counts
+        else:
+            img = self.accumulator.to_numpy() / max(self.spp, 1)
         img = img.transpose(1, 0, 2) # → (H, W, 3)，row 0 = py=0 = 视口底部
         return np.ascontiguousarray(np.flipud(img))  # 翻转，使 row 0 = 视口顶部
 
     def get_aovs(self) -> dict:
-        counts_2d = np.maximum(self.pixel_sample_count.to_numpy(), 1)
+        if not self.enable_aovs and not self.enable_adaptive:
+            raise RuntimeError("PathTracer 创建时未启用 AOV 缓冲")
+        if self.enable_adaptive:
+            counts_2d = np.maximum(self.pixel_sample_count.to_numpy(), 1)
+            n = self.pixel_sample_count.to_numpy()
+        else:
+            counts_2d = np.full((self.width, self.height), max(self.spp, 1), np.int32)
+            n = np.full((self.width, self.height), self.spp, np.int32)
         counts = counts_2d[..., None]
         albedo = self.aov_albedo.to_numpy() / counts
         normal = self.aov_normal.to_numpy() / counts
         normal /= np.maximum(np.linalg.norm(normal, axis=2, keepdims=True), 1e-8)
         depth = self.aov_depth.to_numpy() / counts_2d
-        n = self.pixel_sample_count.to_numpy()
         variance = np.zeros_like(depth, np.float32)
         valid = n > 1
         variance[valid] = self.lum_m2.to_numpy()[valid] / (n[valid] - 1)
@@ -164,7 +265,9 @@ class PathTracer:
         dst[x, 0] 显示在屏幕底部，与 accumulator[x, 0]（视口底部像素）对应。
         """
         for x, y in self.accumulator:
-            n = float(ti.max(self.pixel_sample_count[x, y], 1))
+            n = float(ti.max(self.sample_count[None], 1))
+            if ti.static(self.enable_adaptive):
+                n = float(ti.max(self.pixel_sample_count[x, y], 1))
             c = self.accumulator[x, y] / n
             # 钳制超亮 firefly（float32 ACES 乘法在 c > ~3.7e18 时溢出）
             c = ti.Vector([ti.min(c[0], 1e6), ti.min(c[1], 1e6), ti.min(c[2], 1e6)])
@@ -223,7 +326,9 @@ class PathTracer:
         attenuation   = ti.Vector([1.0, 1.0, 1.0])
         cur_o         = ray_origin
         cur_d         = ray_dir
-        last_specular = True   # 摄像机射线视为"镜面"（初次命中光源需计入）
+        last_specular = True   # 摄像机射线视为“镜面”（初次命中光源需计入）
+        last_bsdf_pdf = 0.0
+        last_vertex = ray_origin
 
         for bounce in range(max_bounce):
             hit_t, hit_pos, hit_normal, hit_tan, hit_uv, hit_mat, front = scene.intersect(
@@ -243,7 +348,7 @@ class PathTracer:
                     first_albedo *= tex_sys.sample(first_mat.albedo_tex_id, hit_uv[0], hit_uv[1])
                 first_albedo = ti.max(0.0, ti.min(1.0, first_albedo))
 
-            scattered, scatter_att, emitted, should_scatter, is_specular = mat_sys.scatter(
+            scattered, scatter_att, emitted, should_scatter, is_specular, scatter_pdf = mat_sys.scatter(
                 cur_d, hit_normal, hit_pos, hit_mat, hit_uv, front, hit_tan, tex_sys
             )
 
@@ -252,8 +357,12 @@ class PathTracer:
             #   PBR 自发光（非 MAT_LIGHT）始终计入（NEE 不采样 PBR 自发光面）。
             mat_type = mat_sys.mats[hit_mat].mat_type
             if mat_type == MAT_LIGHT:
-                if last_specular or light_sampler.sampled_material[hit_mat] == 0:
-                    color += attenuation * emitted
+                mis_weight = 1.0
+                if not last_specular and light_sampler.sampled_material[hit_mat] != 0:
+                    light_pdf = light_sampler.pdf_for_hit(
+                        last_vertex, hit_pos, hit_normal, hit_mat)
+                    mis_weight = _power_heuristic(last_bsdf_pdf, light_pdf)
+                color += attenuation * emitted * mis_weight
             else:
                 color += attenuation * emitted
 
@@ -267,6 +376,8 @@ class PathTracer:
                 color += attenuation * nee
 
             last_specular = is_specular
+            last_bsdf_pdf = scatter_pdf
+            last_vertex = hit_pos
             attenuation  *= scatter_att
 
             # 俄罗斯轮盘赌
@@ -278,7 +389,10 @@ class PathTracer:
                     break
                 attenuation /= rr_prob
 
-            cur_o = hit_pos
+            # 不让下一条路径从数学意义上的同一个表面点出发。单靠下一次求交的
+            # t_min 无法可靠抵御大坐标/大半径几何体上的 float32 舍入误差。
+            offset_sign = 1.0 if scattered.dot(hit_normal) >= 0.0 else -1.0
+            cur_o = hit_pos + hit_normal * (T_MIN * offset_sign)
             cur_d = scattered
 
         return color, first_albedo, first_normal, first_depth
@@ -307,29 +421,21 @@ def _nee_contrib(ray_dir, hit_pos, hit_normal, hit_mat: ti.i32, hit_uv,
     """
     contrib = ti.Vector([0.0, 0.0, 0.0])
 
-    u1                         = ti.random()
-    lpos, lnrm, lemit, pdf_A, valid = light_sampler.sample(u1)
+    u1 = ti.random()
+    light_dir, dist, lemit, pdf_w, valid = light_sampler.sample(hit_pos, u1)
 
     if valid:
-        to_light = lpos - hit_pos
-        dist2    = to_light.dot(to_light)
-        dist     = ti.sqrt(dist2)
-
         if dist > 1e-6:
-            light_dir = to_light / dist
-
             cos_hit   = hit_normal.dot(light_dir)
-            cos_light = -light_dir.dot(lnrm)
-
-            if cos_hit > 1e-4 and cos_light > 1e-4:
+            if cos_hit > 1e-4 and pdf_w > 1e-12:
                 # 阴影射线：从 hit_pos 沿法线偏移 T_MIN，向光源方向追踪至 dist 前
                 # 注意：不能用 _ 重复接收不同类型（vec3/vec2 冲突），需用不同名称
-                shadow_t, _sp, _sn, _st, _suv, shadow_mat, _sf = scene.intersect(
+                blocked = scene.occluded(
                     hit_pos + hit_normal * T_MIN,
                     light_dir, T_MIN, dist * (1.0 - 1e-3)
                 )
 
-                if shadow_mat < 0:   # 路径未被遮挡
+                if blocked == 0:   # 路径未被遮挡
                     # 评估与当前随机漫反射分支匹配的 BRDF。
                     # Clearcoat/PBR 只在选中漫反射分支时执行 NEE，
                     # 因此需除以该分支概率，否则直接光会系统性偏暗。
@@ -340,9 +446,11 @@ def _nee_contrib(ray_dir, hit_pos, hit_normal, hit_mat: ti.i32, hit_uv,
                     albedo = ti.min(albedo, 1.0)
 
                     diffuse_brdf = albedo / _PI
+                    bsdf_pdf = cos_hit / _PI
                     if mat.mat_type == MAT_CLEARCOAT:
                         branch_pdf = ti.max(1.0 - mat.spec_prob, 1e-4)
                         diffuse_brdf = diffuse_brdf / branch_pdf
+                        bsdf_pdf *= branch_pdf
                     elif mat.mat_type == MAT_PBR:
                         metallic = mat.spec_prob
                         if mat.mr_tex_id >= 0:
@@ -356,10 +464,19 @@ def _nee_contrib(ray_dir, hit_pos, hit_normal, hit_mat: ti.i32, hit_uv,
                         branch_pdf = ti.max(1.0 - (fresnel[0] + fresnel[1] + fresnel[2]) / 3.0, 0.02)
                         diffuse_brdf = albedo * (1.0 - metallic) * \
                                        (ti.Vector([1.0, 1.0, 1.0]) - fresnel) / (_PI * branch_pdf)
+                        bsdf_pdf *= branch_pdf
 
-                    # 面积采样转立体角：dω = dA * cos_light / dist²
-                    # L_direct = f_r * L_emit * cos_hit / (pdf_A * dist² / cos_light)
-                    geometry = cos_hit * cos_light / (pdf_A * dist2)
-                    contrib  = diffuse_brdf * lemit * geometry
+                    mis_weight = _power_heuristic(pdf_w, bsdf_pdf)
+                    contrib = diffuse_brdf * lemit * (cos_hit / pdf_w) * mis_weight
 
     return contrib
+
+
+@ti.func
+def _power_heuristic(pdf_a: ti.f32, pdf_b: ti.f32):
+    a2 = pdf_a * pdf_a
+    b2 = pdf_b * pdf_b
+    weight = 0.0
+    if a2 + b2 > 0.0:
+        weight = a2 / (a2 + b2)
+    return weight
