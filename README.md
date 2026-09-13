@@ -204,3 +204,8 @@ python -m pytest -q
 ## 许可证
 
 项目使用 [MIT License](LICENSE)。
+
+## 联系与交流
+
+如果你对这个项目感兴趣、在使用中遇到问题，或者希望进一步探索 Taichi、路径追踪与渲染算法，欢迎通过邮件联系：
+[joyful.beihai@gmail.com](mailto:joyful.beihai@gmail.com)。
