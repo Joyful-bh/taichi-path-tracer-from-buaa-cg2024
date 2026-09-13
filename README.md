@@ -1,6 +1,23 @@
 # Taichi 路径追踪渲染器
 
-这是一个使用 Python 和 Taichi 实现的蒙特卡洛路径追踪器。项目支持 YAML 场景配置、BVH 加速、多种材质、GLB/GLTF 纹理材质导入、三角形/球形光源直接采样与 MIS，以及渐进式预览和离线 PNG 输出。
+一个使用 Python 与 Taichi 从头实现的 GPU 加速蒙特卡洛路径追踪器。项目以清晰、可配置和便于实验为目标，在不依赖现成渲染引擎的情况下实现从场景加载、BVH 构建、光线求交和材质散射，到直接光照采样、渐进渲染、AOV 与 OIDN 降噪的完整渲染流程。
+
+它既可以作为可直接运行的离线渲染器，也可以用于研究 Taichi 后端上的光线追踪算法、GPU 性能瓶颈和不同积分器架构。场景由 YAML 描述，支持 CPU、CUDA 与 Vulkan 后端。
+
+## 渲染结果
+
+<table>
+  <tr>
+    <td width="50%"><img src="output/bvh_knight_cornell.png" alt="镜面棋盘房间中的低多边形国际象棋" /></td>
+    <td width="50%"><img src="output/dragon_and_spheres.png" alt="龙模型与多种材质球" /></td>
+  </tr>
+  <tr>
+    <td align="center">镜面棋盘房间：复杂网格、景深、彩色面光源与多次反射</td>
+    <td align="center">Dragon and Spheres：复杂网格、漫反射、清漆、金属与介质材质</td>
+  </tr>
+</table>
+
+以上图片均由本项目的 Taichi 路径追踪器直接渲染，未使用外部渲染引擎。
 
 ## 主要功能
 
