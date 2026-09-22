@@ -1,6 +1,6 @@
 # 无损迁移自：重构光线追踪/改进的BVH.py
 render:
-  backend: cuda
+  backend: metal
   width: 1200
   height: 800
   samples_per_pixel: 20000

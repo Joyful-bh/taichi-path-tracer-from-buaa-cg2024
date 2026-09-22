@@ -1,7 +1,7 @@
 # 迁移自：重构光线追踪/渲染龙.py
 # 旧脚本未固定随机种子；此预设保留原生成规则并固定 seed 以便复现。
 render:
-  backend: cuda
+  backend: metal
   width: 2560
   height: 1440
   samples_per_pixel: 30000

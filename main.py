@@ -58,8 +58,8 @@ def main():
     # 2. 初始化 Taichi（全局只调用一次，在任何 ti.field 分配前）
     # ----------------------------------------------------------------
     import taichi as ti
-    backend_map = {'cuda': ti.cuda, 'vulkan': ti.vulkan, 'cpu': ti.cpu}
-    ti.init(arch=backend_map.get(cfg.backend, ti.cuda),
+    backend_map = {'cuda': ti.cuda, 'vulkan': ti.vulkan, 'cpu': ti.cpu, 'metal':ti.metal}
+    ti.init(arch=backend_map.get(cfg.backend, ti.cpu),
             default_fp=ti.f32,
             random_seed=42)
 
