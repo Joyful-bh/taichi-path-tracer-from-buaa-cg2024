@@ -59,9 +59,15 @@ def main():
     # ----------------------------------------------------------------
     import taichi as ti
     backend_map = {'cuda': ti.cuda, 'vulkan': ti.vulkan, 'cpu': ti.cpu, 'metal':ti.metal}
-    ti.init(arch=backend_map.get(cfg.backend, ti.cpu),
-            default_fp=ti.f32,
-            random_seed=42)
+    try:
+        ti.init(arch=backend_map.get(cfg.backend, None),
+                default_fp=ti.f32,
+                random_seed=42)
+    except Exception as e:
+        print(f"❌ metal后端初始化失败: {e}, 自动降级到 ti.cpu")
+        ti.init(arch=ti.cpu,
+                default_fp=ti.f32,
+                random_seed=42)
 
     # ----------------------------------------------------------------
     # 3. 构建场景（分配 ti.field，ti.init() 之后才能执行）

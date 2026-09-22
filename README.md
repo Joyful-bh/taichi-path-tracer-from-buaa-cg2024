@@ -37,22 +37,18 @@
 - Python 3.10 或更高版本
 - M芯片, Metal框架
 
-
 ```bash
-
-python -m venv .venv # 建议在虚拟环境中安装依赖：
-source 
-python -m pip install -e .
+git clone -b Mac_M_chips --single-branch https://github.com/KevinLeeeee323/taichi-path-tracer-from-buaa-cg2024.git # clone本仓库的 Mac_M_chips 分支
+conda create -n cg2024 python=3.12 # 创建对应conda环境
+conda activate cg2024 # 激活环境
+pip install -r requirements.txt # 安装依赖
 ```
 
-开发环境（额外安装 pytest）：
+## 相比 main 分支, 本分支中代码主要修改内容:
+1. `main.py` 61-71行是代码全局 taichi 初始化, 需要让其适配 metal 框架, 具体来说就是要写成 `ti.init(arch=ti.metal)`这种的. 因此, 修改了`scene_files`下面每个`.yaml`文件的`render/backend`部分为 `metal`, 并且`main.py`69行使用`ti.cpu`兜底, 作为 Metal 后端不被支持时的备选方案.
+2. Taichi Metal 后端**不支持 64 位浮点数（double）**, 因此需要把整个项目中所有的`ti.f64`改成`ti.f32`.
+3. 目前尚未对下面所说的 "OIDN高质量降噪"进行验证, 因此使用带降噪的版本, 会报错. 并需要额外安装OIDN, Ninja, CMake, ISPC等.
 
-```powershell
-python -m pip install -e ".[dev]"
-```
-
-`requirements.txt` 继续保留给偏好传统依赖安装的用户；`pyproject.toml` 是项目元数据、
-依赖和命令行入口的唯一发布配置。
 
 ## 使用方法
 
