@@ -16,58 +16,25 @@ class OIDNError(RuntimeError):
     """Raised when OIDN is unavailable or rejects an image."""
 
 
-def _oidn_candidates(executable: str = 'auto') -> list[str | Path]:
-    """Return explicit and conventional OIDN executable locations in priority order."""
-    candidates: list[str | Path] = []
+def find_oidn(executable: str = 'auto') -> str:
+    """Resolve oidnDenoise without silently falling back to another algorithm."""
+    candidates = []
     if executable and executable.lower() != 'auto':
         candidates.append(executable)
-
     env_path = os.environ.get('OIDN_DENOISE_EXECUTABLE')
     if env_path:
         candidates.append(env_path)
+    found = shutil.which('oidnDenoise') or shutil.which('oidnDenoise.exe')
+    if found:
+        candidates.append(found)
 
-    # ``shutil.which`` handles PATH entries and executable-bit checks for us.
-    for name in ('oidnDenoise', 'oidnDenoise.exe'):
-        found = shutil.which(name)
-        if found:
-            candidates.append(found)
-
-    # Source builds, especially on macOS, commonly leave the tool in
-    # <source-or-install-root>/build/oidnDenoise rather than installing it.
-    roots: list[Path] = []
-    for variable in ('OIDN_ROOT', 'OIDN_DIR', 'OPEN_IMAGE_DENOISE_ROOT'):
-        value = os.environ.get(variable)
-        if value:
-            roots.append(Path(value).expanduser())
-    home = Path.home()
-    roots.extend(home / name for name in ('oidn', 'OIDN', 'openimagedenoise', 'OpenImageDenoise'))
-    roots.extend((Path.cwd(), Path(__file__).resolve().parents[2]))
-    for root in roots:
-        for name in ('oidnDenoise', 'oidnDenoise.exe'):
-            candidates.extend((
-                root / 'build' / name,
-                root / 'build' / 'apps' / name,
-                root / 'bin' / name,
-            ))
-    return candidates
-
-
-def find_oidn(executable: str = 'auto') -> str:
-    """Resolve oidnDenoise without silently falling back to another algorithm."""
-    candidates = _oidn_candidates(executable)
-    seen: set[str] = set()
     for candidate in candidates:
         path = Path(candidate).expanduser()
-        key = str(path)
-        if key in seen:
-            continue
-        seen.add(key)
-        if path.is_file() and os.access(path, os.X_OK):
+        if path.is_file():
             return str(path.resolve())
     raise OIDNError(
-        "未找到可执行的 oidnDenoise。请将 OIDN 的 bin 目录加入 PATH，或设置"
-        " OIDN_DENOISE_EXECUTABLE；源码构建也可放在 ~/oidn/build/oidnDenoise，"
-        "或在 denoising.executable 中指定绝对路径。"
+        "未找到 oidnDenoise。请安装 Intel Open Image Denoise，并将其 bin 目录加入 "
+        "PATH；或在 denoising.executable / OIDN_DENOISE_EXECUTABLE 中指定可执行文件。"
     )
 
 
