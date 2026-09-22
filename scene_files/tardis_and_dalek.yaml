@@ -1,5 +1,5 @@
 render:
-  backend: cuda
+  backend: metal
   width: 2000
   height: 2000
   samples_per_pixel: 10000

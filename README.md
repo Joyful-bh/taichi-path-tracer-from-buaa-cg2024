@@ -4,14 +4,14 @@
 
 一个使用 Python 与 Taichi 从头实现的 GPU 加速蒙特卡洛路径追踪器。项目以清晰、可配置和便于实验为目标，在不依赖现成渲染引擎的情况下实现从场景加载、BVH 构建、光线求交和材质散射，到直接光照采样、渐进渲染、AOV 与 OIDN 降噪的完整渲染流程。
 
-它既可以作为可直接运行的离线渲染器，也可以用于研究 Taichi 后端上的光线追踪算法、GPU 性能瓶颈和不同积分器架构。场景由 YAML 描述，支持 CPU、CUDA 与 Vulkan 后端。
+它既可以作为可直接运行的离线渲染器，也可以用于研究 Taichi 后端上的光线追踪算法、GPU 性能瓶颈和不同积分器架构。场景由 YAML 描述，支持 CPU、CUDA、Vulkan 和 Metal 后端。
 
 ## 渲染结果
 
 <table>
   <tr>
-    <td width="50%"><img src="output/bvh_knight_cornell.png" alt="镜面棋盘房间中的低多边形国际象棋" /></td>
-    <td width="50%"><img src="output/dragon_and_spheres.png" alt="龙模型与多种材质球" /></td>
+    <td width="50%"><img src="Display/bvh_knight_cornell.png" alt="镜面棋盘房间中的低多边形国际象棋" /></td>
+    <td width="50%"><img src="Display/dragon_and_spheres.png" alt="龙模型与多种材质球" /></td>
   </tr>
   <tr>
     <td align="center">镜面棋盘房间：复杂网格、景深、彩色面光源与多次反射</td>
@@ -35,30 +35,19 @@
 ## 环境要求
 
 - Python 3.10 或更高版本
-- 使用 CUDA 后端时需要可用的 NVIDIA GPU 和驱动
-- Vulkan 后端需要系统提供 Vulkan 支持
-
-建议在虚拟环境中安装依赖：
+- M芯片, Metal框架
 
 ```bash
-python -m venv .venv
+git clone -b Mac_M_chips --single-branch https://github.com/KevinLeeeee323/taichi-path-tracer-from-buaa-cg2024.git # clone本仓库的 Mac_M_chips 分支
+conda create -n cg2024 python=3.12 # 创建对应conda环境
+conda activate cg2024 # 激活环境
+pip install -r requirements.txt # 安装依赖
 ```
 
-Windows PowerShell：
-
-```powershell
-.venv\Scripts\Activate.ps1
-python -m pip install -e .
-```
-
-开发环境（额外安装 pytest）：
-
-```powershell
-python -m pip install -e ".[dev]"
-```
-
-`requirements.txt` 继续保留给偏好传统依赖安装的用户；`pyproject.toml` 是项目元数据、
-依赖和命令行入口的唯一发布配置。
+## 相比 main 分支, 本分支中代码主要修改内容:
+1. `main.py` 61-71行是代码全局 taichi 初始化, 需要让其适配 metal 框架, 具体来说就是要写成 `ti.init(arch=ti.metal)`这种的. 因此, 修改了`scene_files`下面每个`.yaml`文件的`render/backend`部分为 `metal`, 并且`main.py`69行使用`ti.cpu`兜底, 作为 Metal 后端不被支持时的备选方案.
+2. Taichi Metal 后端**不支持 64 位浮点数（double）**, 因此需要把整个项目中所有的`ti.f64`改成`ti.f32`.
+3. OIDN高质量降噪已通过验证, 可正常开启, 但需要额外安装OIDN, Ninja, CMake, ISPC等. 为了能够让$PATH 找到 OIDN, 对`src/io/oidn_denoiser.py`进行了相关修改. 
 
 ## 使用方法
 
@@ -107,7 +96,15 @@ render:
 项目通过 Intel Open Image Denoise 的官方 `oidnDenoise` 程序处理线性 HDR beauty，
 并默认使用反照率和世界空间法线 AOV 保护材质、几何边界。OIDN 是独立的原生运行时，
 不属于 Python requirements；请安装官方 OIDN 2.x，并将 `bin` 加入 `PATH`，或设置
-`OIDN_DENOISE_EXECUTABLE`。如果系统临时目录不可写，可用 `OIDN_TEMP_DIR` 指向一个
+`OIDN_DENOISE_EXECUTABLE`。比如在运行前, 手动指定:
+
+```bash
+export OIDN_DENOISE_EXECUTABLE="$HOME/oidn/build/oidnDenoise"
+```
+
+项目也会自动查找常见的源码构建路径，例如
+`~/oidn/build/oidnDenoise`；也可以通过 `OIDN_ROOT` 指定 OIDN 源码/安装根目录。
+如果系统临时目录不可写，可用 `OIDN_TEMP_DIR` 指向一个
 可写目录。也可以在场景中填写可执行文件绝对路径：
 
 ```yaml

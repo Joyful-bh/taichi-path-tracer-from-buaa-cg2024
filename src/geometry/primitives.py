@@ -96,13 +96,13 @@ class SphereSystem:
         # 并导致二次射线产生规律性的伪自相交。仅对大尺度球提升二次方程精度，
         # 普通球仍走更快的 float32 路径。
         if ti.abs(r) >= 1024.0:
-            ox = ti.cast(ray_origin[0], ti.f64) - ti.cast(c[0], ti.f64)
-            oy = ti.cast(ray_origin[1], ti.f64) - ti.cast(c[1], ti.f64)
-            oz = ti.cast(ray_origin[2], ti.f64) - ti.cast(c[2], ti.f64)
-            dx = ti.cast(ray_dir[0], ti.f64)
-            dy = ti.cast(ray_dir[1], ti.f64)
-            dz = ti.cast(ray_dir[2], ti.f64)
-            rd = ti.cast(r, ti.f64)
+            ox = ti.cast(ray_origin[0], ti.f32) - ti.cast(c[0], ti.f32)
+            oy = ti.cast(ray_origin[1], ti.f32) - ti.cast(c[1], ti.f32)
+            oz = ti.cast(ray_origin[2], ti.f32) - ti.cast(c[2], ti.f32)
+            dx = ti.cast(ray_dir[0], ti.f32)
+            dy = ti.cast(ray_dir[1], ti.f32)
+            dz = ti.cast(ray_dir[2], ti.f32)
+            rd = ti.cast(r, ti.f32)
             ad = dx * dx + dy * dy + dz * dz
             hbd = ox * dx + oy * dy + oz * dz
             cd = ox * ox + oy * oy + oz * oz - rd * rd
@@ -110,9 +110,9 @@ class SphereSystem:
             if discd >= 0.0:
                 sqrt_d = ti.sqrt(discd)
                 root = (-hbd - sqrt_d) / ad
-                if not (ti.cast(t_min, ti.f64) < root < ti.cast(t_max, ti.f64)):
+                if not (ti.cast(t_min, ti.f32) < root < ti.cast(t_max, ti.f32)):
                     root = (-hbd + sqrt_d) / ad
-                if ti.cast(t_min, ti.f64) < root < ti.cast(t_max, ti.f64):
+                if ti.cast(t_min, ti.f32) < root < ti.cast(t_max, ti.f32):
                     hit_t = ti.cast(root, ti.f32)
         elif disc >= 0.0:
             sqrt_d = ti.sqrt(disc)
